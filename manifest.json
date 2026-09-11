@@ -1,9 +1,9 @@
 {
   "id": "dsh-native",
   "name": "DSH Native",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "minAppVersion": "1.4.0",
-  "description": "DeepSeek Harness as a native Obsidian panel: driven by the official SDK protocol, no iframe, no webview injection, no build step, resilient to DSH upgrades. 原生面板驱动 DSH，走官方 SDK 协议，不嵌网页、不注入、无构建依赖。",
+  "description": "在 Obsidian 中以原生面板使用 DeepSeek Harness，通过其 SDK 协议连接。Native Obsidian panel for DeepSeek Harness, connected over its SDK protocol.",
   "author": "Ookura-Resona",
   "authorUrl": "https://github.com/Ookura-Resona",
   "isDesktopOnly": true
