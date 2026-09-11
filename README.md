@@ -50,6 +50,23 @@ node <你的 dsh 仓库>/apps/cli/lib/bin.js --profile sdk
 3. 到插件设置里点「开始检测」检查环境，再点「测试连接」
    连接成功会提示 `deepseek-harness-sdk-runtime v0.0.1` 以及握手耗时
 
+### dsh 装在哪里都能用
+
+插件不假定 dsh 的位置，也不关心你的仓库叫什么名字。它会按下面的顺序自动探测启动器：
+
+| 顺序 | 位置 |
+|---|---|
+| 1 | `<家目录>/deepseek-harness/apps/cli/lib/bin.js`（git 检出。另外也试 `code/` 与 `projects/` 两个常见目录） |
+| 2 | npm 全局安装：Windows 在 `<家目录>/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js`；macOS / Linux 在 `/usr/local/lib/node_modules/`、`/usr/lib/node_modules/`、`/opt/homebrew/lib/node_modules/` 下 |
+
+都不匹配时，在设置里把「dsh CLI 产物」填成绝对路径即可——仓库放在哪里、叫什么名字都行。
+点「自动探测」会重新找一遍，「开始检测」会逐项说明缺什么。
+
+node 也是同样的处理：先找几个常见安装位置，找不到就回退到 PATH 上的 `node`，
+所以使用 nvm、fnm 这类版本管理器也没问题。
+
+换句话说，插件里没有任何写死的机器路径或用户名；除 `node` 与 dsh 之外，它不需要别的工具。
+
 ## 使用
 
 ### 打开面板

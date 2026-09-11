@@ -517,5 +517,66 @@ test('不是检出布局 -> 判定为不适用', () => {
 })
 
 console.log('')
+console.log('可移植性（换一台机器、换一个仓库路径是否还能用）')
+
+test('源码里没有写死某台机器的用户目录', () => {
+  assert.ok(
+    !MAIN_SOURCE.includes('C:\\Users\\'),
+    '不该出现 C:\\Users\\ 字面量：家目录必须用 os.homedir() 拼，否则换台机器就失效',
+  )
+})
+
+test('源码里没有写死某个具体用户名', () => {
+  const offenders = ['WPL', 'Ookura'].filter((name) => MAIN_SOURCE.includes(name))
+  assert.deepStrictEqual(offenders, [], `源码里出现了具体用户名：${offenders.join(', ')}`)
+})
+
+test('CLI 探测同时覆盖 git 检出与 npm 全局两种安装形态', () => {
+  // 直接检查源码里的候选串，避免为了测试而向模块外导出内部常量
+  assert.ok(
+    MAIN_SOURCE.includes("'deepseek-harness', 'apps', 'cli', 'lib', 'bin.js'"),
+    '缺少 git 检出形态的候选路径',
+  )
+  assert.ok(
+    MAIN_SOURCE.includes("'@deepseek-ai', 'dsh', 'lib', 'bin.js'"),
+    '缺少 npm 全局安装形态的候选路径',
+  )
+  assert.ok(
+    MAIN_SOURCE.includes("'/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js'"),
+    '缺少 macOS / Linux 的 npm 候选路径',
+  )
+})
+
+test('node 探测在候选都不存在时回退为 PATH 上的 node', () => {
+  assert.ok(
+    MAIN_SOURCE.includes("firstExisting(NODE_CANDIDATES, 'node')"),
+    'node 必须有 PATH 回退，否则用 nvm/fnm 的人会直接卡住',
+  )
+})
+
+test('找不到 CLI 时给出可执行的修复指引，而不是静默失败', () => {
+  const error = new Error('x')
+  error.code = ERR.noCli
+  const info = explainError(error)
+  assert.ok(info.actions.includes('settings'), '应提供「打开设置」')
+  assert.ok(info.actions.includes('check'), '应提供「检测环境」')
+  assert.ok(
+    info.hints.some((hint) => hint.includes('pnpm run build')),
+    `应告诉用户去构建：${JSON.stringify(info.hints)}`,
+  )
+})
+
+test('工作区目录默认取自 vault，而不是写死路径', () => {
+  assert.ok(
+    MAIN_SOURCE.includes('getBasePath()'),
+    '工作区默认应由 vault 路径推导',
+  )
+  assert.ok(
+    MAIN_SOURCE.includes("path.join(os.homedir(), '.dsh')"),
+    'DSH_HOME 默认应由家目录推导',
+  )
+})
+
+console.log('')
 console.log(`结果：${passed} 通过，${failed} 失败`)
 process.exit(failed === 0 ? 0 : 1)
