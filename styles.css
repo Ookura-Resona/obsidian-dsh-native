@@ -15,6 +15,7 @@
   padding: 6px 8px;
   border-bottom: 1px solid var(--background-modifier-border);
   flex: 0 0 auto;
+  flex-wrap: wrap;
 }
 
 .dsh-status {
@@ -49,9 +50,15 @@
   50% { opacity: 0.35; }
 }
 
-.dsh-header button {
+.dsh-header-actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.dsh-header-actions button {
   font-size: var(--font-ui-smaller);
-  padding: 2px 8px;
+  padding: 2px 7px;
   height: auto;
   box-shadow: none;
 }
@@ -121,6 +128,52 @@
   font-style: italic;
 }
 
+/* ---------- 错误卡片（可操作） ---------- */
+.dsh-error-card {
+  border: 1px solid var(--background-modifier-error);
+  border-left: 3px solid var(--color-red);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  padding: 8px 10px;
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
+}
+
+.dsh-error-title {
+  font-weight: var(--font-semibold);
+  color: var(--text-error);
+  margin-bottom: 4px;
+}
+
+.dsh-error-detail {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+.dsh-error-hints {
+  margin: 0 0 6px 0;
+  padding-left: 1.2em;
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+}
+
+.dsh-error-hints li { margin: 2px 0; }
+
+.dsh-error-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.dsh-error-actions button {
+  font-size: var(--font-ui-smaller);
+  padding: 2px 10px;
+  height: auto;
+}
+
 /* ---------- 输入区 ---------- */
 .dsh-input-row {
   flex: 0 0 auto;
@@ -150,10 +203,93 @@
   font-size: var(--font-ui-smaller);
   color: var(--text-faint);
   margin-right: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dsh-input-actions button {
   font-size: var(--font-ui-smaller);
   padding: 2px 10px;
   height: auto;
+}
+
+/* ---------- 设置页：环境检测结果 ---------- */
+.dsh-env-list:not(:empty) {
+  margin-bottom: 12px;
+}
+
+.dsh-env-row {
+  display: flex;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  margin-bottom: 4px;
+}
+
+.dsh-env-row.is-fail {
+  border-left: 3px solid var(--color-red);
+}
+
+.dsh-env-row.is-warn {
+  border-left: 3px solid var(--color-orange);
+}
+
+.dsh-env-row.is-ok {
+  border-left: 3px solid var(--color-green);
+}
+
+.dsh-env-icon { flex: 0 0 auto; }
+
+.dsh-env-body { min-width: 0; }
+
+.dsh-env-name {
+  font-weight: var(--font-semibold);
+  font-size: var(--font-ui-small);
+}
+
+.dsh-env-detail {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.dsh-env-fix {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-accent);
+  margin-top: 2px;
+}
+
+.dsh-env-summary {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  padding: 4px 2px;
+}
+
+/* ---------- 设置页：诊断 ---------- */
+.dsh-diag {
+  background: var(--background-secondary);
+  border-radius: var(--radius-s);
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+
+.dsh-diag-row {
+  display: flex;
+  gap: 8px;
+  font-size: var(--font-ui-smaller);
+  line-height: 1.7;
+}
+
+.dsh-diag-label {
+  flex: 0 0 11em;
+  color: var(--text-muted);
+}
+
+.dsh-diag-value {
+  flex: 1 1 auto;
+  font-family: var(--font-monospace);
+  word-break: break-all;
 }
