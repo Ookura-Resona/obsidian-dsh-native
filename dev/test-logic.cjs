@@ -52,6 +52,7 @@ const main = require(MAIN_PATH)
 const {
   DshView, explainError, buildSelectionPayload, buildSelectionReference, setLanguage, DICT, ERR,
   resolveRoute, readDshDefaultModel, parseYamlSections, checkBuildFreshness, FALLBACK_ROUTE,
+  isLegacyDefaultRoute,
 } = main
 
 // 逻辑断言默认按中文，英文另有专门用例
@@ -455,6 +456,28 @@ test('DSH 换了默认模型，解析结果跟着变（这就是「跟随」）'
   const home = makeHome('changed-home', 'agent-default-model:\n  provider: deepseek-official\n  model: deepseek-v5-whatever\n')
   const route = resolveRoute({ provider: '', model: '' }, home)
   assert.strictEqual(route.model, 'deepseek-v5-whatever')
+})
+
+test('升级迁移：旧版本写下的内置默认值会被识别出来', () => {
+  assert.strictEqual(
+    isLegacyDefaultRoute({ provider: 'deepseek-official', model: 'deepseek-v4-flash-vision-exp', reasoningEffort: 'high' }),
+    true,
+  )
+  assert.strictEqual(
+    isLegacyDefaultRoute({ provider: 'deepseek-official', model: 'deepseek-v4-flash-vision-exp', reasoningEffort: '' }),
+    false,
+    '用户动过 effort 就不该当成旧默认值',
+  )
+  assert.strictEqual(isLegacyDefaultRoute({ provider: '', model: '', reasoningEffort: '' }), false)
+  assert.strictEqual(isLegacyDefaultRoute({ provider: 'acme', model: 'x', reasoningEffort: 'high' }), false, '用户自己填的不该被清掉')
+})
+
+test('升级迁移后的设置会跟随 DSH', () => {
+  // 模拟 loadSettings 里清空旧值之后的状态
+  const migrated = { provider: '', model: '', reasoningEffort: '' }
+  const route = resolveRoute(migrated, REAL_HOME)
+  assert.strictEqual(route.source, 'dsh')
+  assert.strictEqual(route.model, 'deepseek-v4-flash-vision-exp')
 })
 
 console.log('')

@@ -786,6 +786,26 @@ const DSH_DEFAULT_MODEL_SECTION = 'agent-default-model'
 const FALLBACK_ROUTE = { provider: 'deepseek-official', model: 'deepseek-v4-flash-vision-exp' }
 
 /**
+ * 1.2.1 及更早版本把内置默认模型直接写进了插件设置。
+ * 升级时要把这组值清掉，否则解析逻辑会把它当成用户的显式覆盖，无法跟随 DSH。
+ */
+const LEGACY_DEFAULT_ROUTE = {
+  provider: 'deepseek-official',
+  model: 'deepseek-v4-flash-vision-exp',
+  reasoningEffort: 'high',
+}
+
+/**
+ * 判断设置里存的是不是旧版本写下的那组内置默认值。
+ * @param {{ provider?: string, model?: string, reasoningEffort?: string }} settings
+ */
+function isLegacyDefaultRoute(settings) {
+  return settings.provider === LEGACY_DEFAULT_ROUTE.provider
+    && settings.model === LEGACY_DEFAULT_ROUTE.model
+    && settings.reasoningEffort === LEGACY_DEFAULT_ROUTE.reasoningEffort
+}
+
+/**
  * 去掉行尾注释（不处理引号内的 `#` 之外的花哨情况）。
  * @param {string} line
  */
@@ -2898,8 +2918,20 @@ class DshPlugin extends Plugin {
     await this.saveSettings()
   }
 
+  /**
+   * 读取设置，并做一次升级迁移。
+   *
+   * 1.2.1 及更早的版本把内置默认模型写进了设置，升级后会被当成显式覆盖，
+   * 导致「跟随 DSH」失效。检测到那组旧值时清空，交回给解析逻辑。
+   */
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData())
+    if (isLegacyDefaultRoute(this.settings)) {
+      this.settings.provider = ''
+      this.settings.model = ''
+      this.settings.reasoningEffort = ''
+      await this.saveSettings()
+    }
   }
 
   async saveSettings() {
@@ -2926,3 +2958,5 @@ module.exports.readDshDefaultModel = readDshDefaultModel
 module.exports.parseYamlSections = parseYamlSections
 module.exports.checkBuildFreshness = checkBuildFreshness
 module.exports.FALLBACK_ROUTE = FALLBACK_ROUTE
+module.exports.isLegacyDefaultRoute = isLegacyDefaultRoute
+module.exports.LEGACY_DEFAULT_ROUTE = LEGACY_DEFAULT_ROUTE

@@ -1,7 +1,7 @@
 {
   "id": "dsh-native",
   "name": "DSH Native",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "minAppVersion": "1.4.0",
   "description": "在 Obsidian 中以原生面板使用 DeepSeek Harness，通过其 SDK 协议连接。Native Obsidian panel for DeepSeek Harness, connected over its SDK protocol.",
   "author": "Ookura-Resona",
