@@ -3,14 +3,22 @@
 本项目的所有重要变更都记录在此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.1.0] - 2026-09-11
+## [1.0.0] - 2026-09-11
 
-首个版本。
+首个正式版本（更名发布）。
+
+### 变更
+
+- 插件 id 由 `dsh-harness` 改为 **`dsh-native`**，名称由 “DeepSeek Harness” 改为 **“DSH Native”**。
+  原因：`dsh-harness` 这个 id 已被另一个 Obsidian 插件占用并登记在官方插件清单中。Obsidian 以 `manifest.json` 的 `id`
+  唯一标识插件，同名会导致两者无法共存，也无法上架。
+- 插件目录由 `.obsidian/plugins/dsh-harness/` 改为 `.obsidian/plugins/dsh-native/`。
+- 仓库由 `obsidian-dsh-harness` 更名为 `obsidian-dsh-native`。
 
 ### 新增
 
-- 右侧边栏对话面板，助手回复使用 Obsidian 原生 Markdown 渲染
-- 以 `sdk` profile 启动 dsh 运行时子进程，用换行分帧的 JSON-RPC 2.0 驱动它
+- 右侧边栏原生对话面板，助手回复使用 Obsidian 原生 `MarkdownRenderer` 渲染（跟随主题）
+- 以 `sdk` profile 启动 DSH 运行时子进程，用换行分帧的 JSON-RPC 2.0 驱动它
 - `initialize` 的 `cwd` 默认设为 vault 根目录，agent 直接读写笔记
 - 复用同一 `sessionId` 实现多轮上下文
 - 命令「把选中内容发给 DSH」：把编辑器选区交给 agent
@@ -30,6 +38,7 @@
 - 完整一轮对话：`running` → `assistant/message` → `turn/end {kind:"completed"}`
 - 多轮上下文：第一轮记住数字 42，第二轮复用同一 `sessionId` 正确答出 `42`
 
-### 已知限制
+## [0.1.0] - 2026-09-11
 
-协议层不支持取消单轮、无法应答审批弹窗、不呈现流式增量。详见 README 的「已知限制」。
+最初以 `dsh-harness` 为 id 发布，随后发现该 id 与既有插件冲突，已由 **1.0.0** 取代并从 Releases 中撤下。
+功能与 1.0.0 相同。

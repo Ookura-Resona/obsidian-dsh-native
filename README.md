@@ -1,42 +1,89 @@
-# DeepSeek Harness for Obsidian
+# DSH Native
 
-把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）作为 AI 协作者嵌进 Obsidian：
-**vault 就是 agent 的工作目录**，它可以直接读你的笔记、写文件、跑多步任务。
+> 把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）作为**原生 Obsidian 面板**使用 —— 走官方 SDK 协议驱动，不嵌网页、不注入、无构建依赖。
 
-An Obsidian desktop plugin that embeds the DeepSeek Harness (`dsh`) runtime as a native
-AI collaborator in your vault — no iframe, no webview: it drives a real `dsh` subprocess.
+**DSH Native** 是一个 Obsidian 桌面端插件。它不是把 DSH 的 Web 界面塞进 iframe，而是直接以子进程方式驱动 DSH 运行时，
+用 Obsidian 自己的界面渲染对话。结果是：**极轻、极稳、原生**。
 
 ---
 
-## 它和「把网页塞进 iframe」有什么不同
+## 为什么选它
 
-这是一个真正驱动 dsh 运行时子进程的原生插件。它以子进程方式启动 `sdk` profile：
+### 1. 不注入、不改你的 DSH 安装
+
+插件不往你的 DSH profile 写补丁层、不向它服务的 `index.html` 注入脚本、不去操作前端的 React 内部状态。
+它只**读**你的 DSH 配置来定位运行时，其余什么都不动。
+
+对比之下，iframe 类方案需要：写 `<DSH_HOME>/profiles/web/cordis.patch.yml`、注册 `webServer.tapIndex` 往页面注入桥接脚本、
+再用原生 setter 驱动 React 受控 textarea。能用，但那是在 DSH 的前端实现上做文章。
+
+### 2. 抗版本漂移
+
+本插件只依赖 DSH 的**官方 SDK 协议**：3 个请求（`initialize` / `session/prompt` / `shutdown`）
+加 4 个通知（`session.event` / `session.status` / `subagent.started` / `subagent.finished`），换行分帧的 JSON-RPC 2.0。
+
+**DSH 前端怎么改版都与本插件无关。** 而依赖 DOM 与 React 内部实现的方案，必须跟着 DSH 的前端跑——
+这也是为什么那类插件通常要维护「兼容/不兼容版本区间」，并在每次 DSH 更新后重写桥接。
+
+### 3. 真正的原生界面
+
+对话渲染用的是 Obsidian 自己的 `MarkdownRenderer`：跟随你的主题、字体、字号、深色模式，
+代码块就是 Obsidian 的代码块。不需要缩放补丁，也不需要「底部垫高」来躲状态栏。
+
+也因为没有 iframe，就**没有 cookie 认证问题**——iframe 方案会因为 `SameSite=Strict` 无法自动认证，
+只能去解析 DSH 启动日志里的 `?token=` 一次性凭证，并引导你改用浏览器打开。
+
+### 4. 极小、可通读
+
+| | 本插件 |
+|---|---|
+| 源码 | **1 个文件，约 33 KB** |
+| 运行时依赖 | **0** |
+| 构建步骤 | **无**（纯 CommonJS，改完直接重载） |
+
+整个插件你花十几分钟能读完。相比之下，编译后动辄 300 KB+、还要注入前端脚本的方案，基本无法审计。
+
+### 5. 边界干净
+
+DSH 服务与你手动跑的 `dsh web` 完全独立：本插件用自己的 `sdk` profile 起进程，
+不占用 3080 端口、不与 Web GUI 抢服务、退出 Obsidian 即结束。
+
+---
+
+## 需要说清楚的取舍
+
+诚实起见：**iframe 方案在功能完整度上更强**，因为它面板里跑的就是完整的 DSH Web UI，审批交互、取消单轮、
+流式输出、以及 DSH 将来新增的任何前端功能都天然具备。
+
+本插件受限于 SDK 协议暴露的能力，**没有**以下功能（详见[已知限制](#已知限制)）：
+
+- 无法应答审批弹窗（协议没有服务端→客户端请求）
+- 无法取消单轮（协议没有取消方法，「停止」只能关进程）
+- 不呈现流式增量（助手消息按 step 整段出现）
+
+如果你需要的是「完整 DSH 体验」，iframe 类插件更合适；
+**如果你要的是一个轻、稳、原生、可审计的 DSH 客户端，选本插件。**
+
+---
+
+## 它怎么工作
+
+以子进程方式启动 DSH 运行时的 `sdk` profile：
 
 ```
 node <checkout>/apps/cli/lib/bin.js --profile sdk
 ```
 
 再按 [`@deepseek-ai/dsh-sdk-protocol`](https://github.com/deepseek-ai/deepseek-harness) 的规定，
-用**换行分帧的 JSON-RPC 2.0** 在 stdin/stdout 上驱动它。协议面很小：
-
-| 方向 | 方法 |
-|---|---|
-| 客户端 → 服务端 | `initialize` / `session/prompt` / `shutdown` |
-| 服务端 → 客户端 | `session.event` / `session.status` / `subagent.started` / `subagent.finished` |
+用换行分帧的 JSON-RPC 2.0 在 stdin/stdout 上驱动它。
 
 三个关键设计点：
 
-- **`initialize` 的 `cwd` 就是 agent 的工作区根目录**（即 `session.header.cwd`）。插件默认把它设为 vault 根目录，因此 agent 直接在你的笔记上工作。
-- **多轮对话靠复用同一个 `sessionId`**：服务端对同一 id 做 `getOrCreateSession`，后续 `session/prompt` 会接着同一个 agent 的上下文继续。
-- **没有构建步骤**。因为协议很小，插件自己实现了这层客户端，`main.js` 是纯 CommonJS，Obsidian 直接加载，不需要 npm 依赖、不需要打包。
+- **`initialize` 的 `cwd` 就是 agent 的工作区根目录**（即 `session.header.cwd`）。默认设为 vault 根目录，因此 agent 直接在你的笔记上工作。
+- **多轮对话靠复用同一个 `sessionId`**：服务端对同一 id 做 `getOrCreateSession`，后续 `session/prompt` 会接着同一上下文继续。
+- **无构建步骤**：因为协议很小，插件自己实现了这层客户端。
 
-## 特性
-
-- 右侧边栏对话面板，助手回复用 Obsidian 原生 Markdown 渲染
-- 命令 `把选中内容发给 DSH`：把编辑器选区直接交给 agent
-- `存入笔记`：把最后一条回复追加到当前笔记
-- 工具调用活动行（可关闭），子 agent 启动提示
-- 设置页可改 provider / model / 工作区 / reasoning effort / max tokens，并带「测试连接」
+---
 
 ## 要求
 
@@ -44,31 +91,31 @@ node <checkout>/apps/cli/lib/bin.js --profile sdk
 |---|---|
 | Obsidian | 桌面端（`isDesktopOnly: true`），依赖 Node 的 `child_process` |
 | Node.js | 能在 Obsidian 子进程里调用到，建议在设置里填绝对路径 |
-| dsh | 一份**已构建**的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 仓库，即 `apps/cli/lib/bin.js` 存在 |
-| 凭据 | dsh 自己的凭据解析（`$DSH_HOME/.credentials.yaml`、环境变量或 `.env`）。**插件不接触、不转发任何密钥** |
+| DSH | 一份**已构建**的 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 仓库，即 `apps/cli/lib/bin.js` 存在 |
+| 凭据 | DSH 自己的凭据解析（`$DSH_HOME/.credentials.yaml`、环境变量或 `.env`）。**插件不接触、不转发任何密钥** |
 
-`$DSH_HOME` 默认是 `~/.dsh`，与 dsh CLI 一致；只有配置目录不在默认位置时才需要填。
+`$DSH_HOME` 默认是 `~/.dsh`，与 DSH CLI 一致；只有配置目录不在默认位置时才需要填。
 
 ## 安装
 
-### 手动
-
-1. 把 `main.js`、`manifest.json`、`styles.css` 放进 `<你的 vault>/.obsidian/plugins/dsh-harness/`
-2. 设置 → 第三方插件 → 关闭「受限模式」→ 在「已安装插件」里打开 **DeepSeek Harness**
-3. 在插件设置里确认 **dsh CLI 产物**路径（点「自动探测」），再点 **测试连接**
-   看到「连接成功：deepseek-harness-sdk-runtime v0.0.1」即链路打通
-
 ### BRAT
 
-本仓库尚未发布 Release。发布后可用 [BRAT](https://github.com/TfTHacker/obsidian42-brat)
-添加 `Ookura-Resona/obsidian-dsh-harness` 来安装与自动更新。
+用 [BRAT](https://github.com/TfTHacker/obsidian42-brat) 添加 `Ookura-Resona/obsidian-dsh-native`。
+
+### 手动
+
+1. 把 `main.js`、`manifest.json`、`styles.css` 放进 `<你的 vault>/.obsidian/plugins/dsh-native/`
+2. 设置 → 第三方插件 → 关闭「受限模式」→ 在「已安装插件」里打开 **DSH Native**
+3. 在插件设置里点「自动探测」，再点「测试连接」
+   看到「连接成功：deepseek-harness-sdk-runtime v0.0.1」即链路打通
 
 ## 使用
 
-- 点左侧栏机器人图标，或运行命令 **`DeepSeek Harness: 打开对话面板`**
+- 点左侧栏机器人图标，或运行命令 **`DSH Native: 打开对话面板`**
 - 输入框：**Enter 发送，Shift+Enter 换行**
+- 命令 **`DSH Native: 把选中内容发给 DSH`**：把编辑器选区（未选中则取全文）直接发给 agent
 - 面板头部：
-  - **新会话** —— 换一个 `sessionId`（同一运行时进程内），清空面板
+  - **新会话** —— 换一个 `sessionId`，清空面板
   - **存入笔记** —— 把最后一条回复追加到当前活动笔记（无活动笔记则复制到剪贴板）
   - **停止** —— 关掉运行时进程
 
@@ -79,7 +126,7 @@ node <checkout>/apps/cli/lib/bin.js --profile sdk
 | dsh CLI 产物（bin.js） | 启动器绝对路径；留空自动探测常见位置 |
 | node 可执行文件 | 留空自动探测，再回退为 PATH 上的 `node` |
 | 工作区目录（cwd） | 作为 `initialize` 的 cwd。**留空 = vault 根目录** |
-| DSH_HOME | 留空 = dsh 默认（`~/.dsh`） |
+| DSH_HOME | 留空 = DSH 默认（`~/.dsh`） |
 | profile | 默认 `sdk`，一般不用改 |
 | provider / model | 默认 `deepseek-official` / `deepseek-v4-flash-vision-exp` |
 | reasoning effort | 默认 `high`，留空则用模型默认值 |
@@ -110,9 +157,10 @@ node <checkout>/apps/cli/lib/bin.js --profile sdk
 
 ## 安全说明
 
-- 沙箱由 dsh 提供，不是本插件：base 系 profile 默认使用 **`workspace-write`** 权限预设，**写入被限制在会话工作区（默认 vault）与平台临时目录内**；读和网络不受限。
+- 沙箱由 DSH 提供，不是本插件：base 系 profile 默认使用 **`workspace-write`** 权限预设，**写入被限制在会话工作区（默认 vault）与平台临时目录内**；读和网络不受限。
 - 因此把工作区目录改成 vault 之外的位置，就等于让 agent 能写那些位置。**建议保持默认。**
-- 插件把 dsh 子进程的环境继承自 Obsidian 进程，额外只加你填的 `DSH_HOME`。
+- 插件把 DSH 子进程的环境继承自 Obsidian 进程，额外只加你填的 `DSH_HOME`。
+- 插件自身不发起任何网络请求，也不含遥测。
 
 ## 开发
 
@@ -134,7 +182,7 @@ node <checkout>/apps/cli/lib/bin.js --profile sdk
 
 ## 相关
 
-- [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) —— dsh 本体
+- [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) —— DSH 本体
 - [Obsidian 插件开发文档](https://docs.obsidian.md/Plugins/Getting+started/Build+a+plugin)
 
 ## License

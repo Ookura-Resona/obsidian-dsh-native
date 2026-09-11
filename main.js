@@ -1,5 +1,8 @@
 /*
- * dsh-harness — 把 DeepSeek Harness 作为 AI 协作者嵌进 Obsidian。
+ * dsh-native — 在 Obsidian 里以原生面板驱动 DeepSeek Harness。
+ *
+ * 与「用 iframe 嵌 DSH 网页」那类方案的根本区别：本插件不注入网页、不修改
+ * DSH 安装、不依赖它的前端 DOM，只走官方 SDK 协议，因此 DSH 升级前端也不易失效。
  *
  * 工作原理
  * --------
@@ -42,7 +45,7 @@ const { randomUUID } = require('crypto')
 
 const { Plugin, ItemView, PluginSettingTab, Setting, Notice, MarkdownRenderer } = obsidian
 
-const VIEW_TYPE = 'dsh-harness-view'
+const VIEW_TYPE = 'dsh-native-view'
 
 /** 一轮对话的兜底等待上限（毫秒）。 */
 const TURN_TIMEOUT_MS = 30 * 60 * 1000
@@ -875,7 +878,7 @@ class DshSettingTab extends PluginSettingTab {
           } catch (error) {
             const message = error && error.message ? error.message : String(error)
             new Notice(`连接失败：${message}`)
-            console.error('[dsh-harness] 连接测试失败', error)
+            console.error('[dsh-native] 连接测试失败', error)
           } finally {
             button.setDisabled(false)
             button.setButtonText('测试')

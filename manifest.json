@@ -1,9 +1,9 @@
 {
-  "id": "dsh-harness",
-  "name": "DeepSeek Harness",
-  "version": "0.1.0",
+  "id": "dsh-native",
+  "name": "DSH Native",
+  "version": "1.0.0",
   "minAppVersion": "1.4.0",
-  "description": "把 DeepSeek Harness (dsh) 作为 AI 协作者嵌入 vault：以仓库为工作目录，可直接读写笔记、检索与执行多步任务。",
+  "description": "DeepSeek Harness as a native Obsidian panel: driven by the official SDK protocol, no iframe, no webview injection, no build step, resilient to DSH upgrades. 原生面板驱动 DSH，走官方 SDK 协议，不嵌网页、不注入、无构建依赖。",
   "author": "Ookura-Resona",
   "authorUrl": "https://github.com/Ookura-Resona",
   "isDesktopOnly": true
