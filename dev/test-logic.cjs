@@ -3,14 +3,17 @@
  *
  * 覆盖：
  *   - main.js 能被加载（捕获语法/require 错误）
- *   - explainError 把各类原始错误映射成「人话 + 动作」
+ *   - i18n：中英词典 key 完全对齐、源码里用到的每个 key 都存在
+ *   - explainError 把各类原始错误映射成「人话 + 动作」（中英两种语言）
  *   - buildSelectionPayload 的三种模式
  *   - DshView.reportTurnEnd 对 TurnEndReason 的处理
+ *   - 渲染与记录的分工（防双重渲染回归）
  *
  * 用法：node dev/test-logic.cjs
  */
 'use strict'
 
+const fs = require('fs')
 const path = require('path')
 const assert = require('assert')
 const Module = require('module')
@@ -40,12 +43,79 @@ function test(name, fn) {
   }
 }
 
+const MAIN_PATH = path.join(__dirname, '..', 'main.js')
+const MAIN_SOURCE = fs.readFileSync(MAIN_PATH, 'utf8')
+
 console.log('加载 main.js…')
-const main = require(path.join(__dirname, '..', 'main.js'))
-const { DshView, explainError, buildSelectionPayload } = main
+const main = require(MAIN_PATH)
+const {
+  DshView, explainError, buildSelectionPayload, buildSelectionReference, setLanguage, DICT, ERR,
+} = main
+
+// 逻辑断言默认按中文，英文另有专门用例
+setLanguage('zh')
 
 console.log('')
-console.log('explainError')
+console.log('i18n')
+
+test('zh 与 en 的 key 集合完全一致', () => {
+  const zh = Object.keys(DICT.zh).sort()
+  const en = Object.keys(DICT.en).sort()
+  const onlyZh = zh.filter((k) => !(k in DICT.en))
+  const onlyEn = en.filter((k) => !(k in DICT.zh))
+  assert.deepStrictEqual(
+    { onlyZh, onlyEn },
+    { onlyZh: [], onlyEn: [] },
+    `词典不对称 —— 仅 zh: ${onlyZh.join(', ')}；仅 en: ${onlyEn.join(', ')}`,
+  )
+  assert.ok(zh.length > 100, `词条太少，可能没扫全：${zh.length}`)
+})
+
+test('源码里用到的每个 t() key 在两份词典里都存在', () => {
+  const used = new Set()
+  for (const match of MAIN_SOURCE.matchAll(/\bt\('([^']+)'/g)) used.add(match[1])
+  assert.ok(used.size > 100, `扫描到的 key 太少，正则可能失配：${used.size}`)
+  const missing = []
+  for (const key of used) {
+    if (!(key in DICT.zh)) missing.push(`zh:${key}`)
+    if (!(key in DICT.en)) missing.push(`en:${key}`)
+  }
+  assert.deepStrictEqual(missing, [], `缺少文案：${missing.join(', ')}`)
+})
+
+test('两份词典里没有未被使用的死词条', () => {
+  const used = new Set()
+  for (const match of MAIN_SOURCE.matchAll(/\bt\('([^']+)'/g)) used.add(match[1])
+  const unused = Object.keys(DICT.zh).filter((key) => !used.has(key))
+  assert.deepStrictEqual(unused, [], `未被引用的词条：${unused.join(', ')}`)
+})
+
+test('占位符 {name} 在两份词典里一一对应', () => {
+  const holders = (text) => [...String(text).matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort()
+  const mismatched = []
+  for (const key of Object.keys(DICT.zh)) {
+    const zh = holders(DICT.zh[key])
+    const en = holders(DICT.en[key])
+    if (zh.join(',') !== en.join(',')) mismatched.push(`${key}: zh=[${zh}] en=[${en}]`)
+  }
+  assert.deepStrictEqual(mismatched, [], `占位符不一致：\n       ${mismatched.join('\n       ')}`)
+})
+
+test('语言切换生效，且未翻译的 key 回退为 key 本身', () => {
+  setLanguage('en')
+  assert.strictEqual(main.getLanguage(), 'en')
+  setLanguage('zh')
+  assert.strictEqual(main.getLanguage(), 'zh')
+  setLanguage('zh-CN')
+  assert.strictEqual(main.getLanguage(), 'zh', 'zh-CN 应归一为 zh')
+  setLanguage('fr')
+  assert.strictEqual(main.getLanguage(), 'en', '非中文应回退为 en')
+  setLanguage('zh')
+})
+
+console.log('')
+console.log('explainError（中文）')
+
 test('ENOENT -> node 路径问题，并给出设置类动作', () => {
   const info = explainError(new Error('spawn C:\\nope\\node.exe ENOENT'))
   assert.strictEqual(info.title, '找不到 node 可执行文件')
@@ -54,15 +124,22 @@ test('ENOENT -> node 路径问题，并给出设置类动作', () => {
   assert.ok(info.hints.length > 0)
 })
 
+test('spawn 失败 code 也能命中 node 分支（不依赖英文文案）', () => {
+  const error = new Error('随便什么消息')
+  error.code = ERR.spawnFailed
+  assert.strictEqual(explainError(error).title, '找不到 node 可执行文件')
+})
+
 test('会话 id 冲突 -> 提示换新会话，而不是当成未知错误', () => {
   const info = explainError(new Error('[-32603] session "session-abc" already exists'))
   assert.strictEqual(info.title, '会话 id 已被占用')
   assert.ok(info.actions.includes('newSession'))
 })
 
-test('缺 bin.js -> 提示去构建', () => {
-  const info = explainError(new Error('未找到 dsh CLI 产物。请在插件设置里填写 bin.js 的绝对路径。'))
-  assert.strictEqual(info.title, '没找到 dsh 的构建产物（bin.js）')
+test('缺 bin.js（带 code）-> 提示去构建', () => {
+  const error = new Error('不管什么语言的消息')
+  error.code = ERR.noCli
+  assert.strictEqual(explainError(error).title, '没找到 dsh 的构建产物（bin.js）')
 })
 
 test('provider 未注册 -> 指向设置页', () => {
@@ -71,13 +148,16 @@ test('provider 未注册 -> 指向设置页', () => {
   assert.deepStrictEqual(info.actions, ['settings'])
 })
 
-test('initialize 超时 -> 提示首次自举较慢', () => {
-  const info = explainError(new Error('initialize 超时（180000ms）'))
-  assert.strictEqual(info.title, 'initialize 握手超时')
+test('超时（带 code）-> 提示首次自举较慢', () => {
+  const error = new Error('whatever')
+  error.code = ERR.timeout
+  assert.strictEqual(explainError(error).title, 'initialize 握手超时')
 })
 
-test('运行时退出 -> 提供重启动作', () => {
-  const info = explainError(new Error('dsh 运行时已退出（code=1, signal=null）'))
+test('运行时退出（带 code）-> 提供重启动作', () => {
+  const error = new Error('whatever')
+  error.code = ERR.exited
+  const info = explainError(error)
   assert.strictEqual(info.title, 'dsh 运行时进程退出了')
   assert.ok(info.actions.includes('restart'))
 })
@@ -95,6 +175,35 @@ test('未知错误也有兜底卡片与动作', () => {
 })
 
 console.log('')
+console.log('explainError / 选区（English）')
+
+test('英文下错误卡片是英文', () => {
+  setLanguage('en')
+  try {
+    const info = explainError(new Error('spawn node ENOENT'))
+    assert.strictEqual(info.title, 'node executable not found')
+    assert.ok(info.hints[0].includes('Set "node executable"'), info.hints[0])
+    const error = new Error('x')
+    error.code = ERR.noCli
+    assert.strictEqual(explainError(error).title, 'dsh build artifact (bin.js) not found')
+  } finally {
+    setLanguage('zh')
+  }
+})
+
+test('英文选区引用是英文措辞', () => {
+  setLanguage('en')
+  try {
+    const ref = buildSelectionReference('notes/a.md', { line: 11, ch: 2 }, { line: 14, ch: 7 }, 87)
+    assert.ok(ref.includes('selected passage'), ref)
+    assert.ok(ref.includes('line 12 col 3'), ref)
+    assert.ok(ref.includes('87 chars'), ref)
+  } finally {
+    setLanguage('zh')
+  }
+})
+
+console.log('')
 console.log('buildSelectionPayload')
 
 /** 造一个只实现所需方法的编辑器替身。 */
@@ -109,8 +218,7 @@ const FILE = { path: '灵茶山艾府/位运算.md' }
 const TEXT = '这是一段被选中的原文'
 
 test('text 模式：只发原文', () => {
-  const out = buildSelectionPayload(fakeEditor(TEXT), FILE, 'text')
-  assert.strictEqual(out, TEXT)
+  assert.strictEqual(buildSelectionPayload(fakeEditor(TEXT), FILE, 'text'), TEXT)
 })
 
 test('reference 模式：含文件与行:列，但不含原文', () => {
@@ -129,8 +237,7 @@ test('both 模式：引用 + 原文都在', () => {
 })
 
 test('没有活动文件时退化为原文', () => {
-  const out = buildSelectionPayload(fakeEditor(TEXT), null, 'reference')
-  assert.strictEqual(out, TEXT)
+  assert.strictEqual(buildSelectionPayload(fakeEditor(TEXT), null, 'reference'), TEXT)
 })
 
 test('空选区返回空串', () => {

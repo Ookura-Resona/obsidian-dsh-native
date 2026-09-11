@@ -30,6 +30,12 @@
  * 3. 所以 sessionId 必须绑定到「运行时进程实例」，进程一换就换新 id。
  *    （见 dev/probe-session-resume.cjs）
  *
+ * 国际化
+ * ------
+ * 界面文案走 DICT + t()，跟随 Obsidian 语言，可在设置里手动覆盖为中文/英文。
+ * 自己抛出的错误带 `code`（如 DSH_NO_CLI），因此错误匹配不依赖界面语言；
+ * 服务端返回的错误（英文）仍按正则匹配。见 dev/test-i18n 相关断言。
+ *
  * 已知限制（协议本身的边界，不是本插件的 bug）
  * -------------------------------------------
  * 1. 协议层没有「取消本轮」方法 —— 「停止」只能关掉整个运行时进程。
@@ -70,6 +76,16 @@ const MAX_ENTRY_CHARS = 20000
 /** 崩溃后自动重连的最大次数。 */
 const MAX_RECONNECT = 3
 
+/** 自己抛出的错误使用的稳定 code（不随界面语言变化）。 */
+const ERR = {
+  noCli: 'DSH_NO_CLI',
+  notRunning: 'DSH_NOT_RUNNING',
+  timeout: 'DSH_TIMEOUT',
+  exited: 'DSH_RUNTIME_EXITED',
+  stopped: 'DSH_STOPPED',
+  spawnFailed: 'DSH_SPAWN_FAILED',
+}
+
 /**
  * 常见 CLI 产物位置，用于「自动探测」。
  * 一律相对于家目录拼，避免把某台机器的绝对路径硬编码进来。
@@ -92,6 +108,8 @@ const NODE_CANDIDATES = [
 ]
 
 const DEFAULT_SETTINGS = {
+  // 'auto' | 'zh' | 'en'
+  language: 'auto',
   nodePath: '',
   cliPath: '',
   dshHome: '',
@@ -111,6 +129,506 @@ const DEFAULT_SETTINGS = {
   lastHandshake: null,
   transcript: null,
 }
+
+/* ------------------------------------------------------------------ *
+ * 国际化
+ * ------------------------------------------------------------------ */
+
+/** 文案字典。zh 与 en 的 key 集合必须完全一致（有测试兜底）。 */
+const DICT = {
+  zh: {
+    // ---- 面板 ----
+    'panel.newSession': '新会话',
+    'panel.restart': '重启',
+    'panel.insertIntoNote': '存入笔记',
+    'panel.stop': '停止',
+    'panel.send': '发送',
+    'panel.inputPlaceholder': '问点什么，或让 agent 直接改你的笔记…（Enter 发送，Shift+Enter 换行）',
+    'panel.workspaceHint': '工作区：{path}',
+    'panel.status.disconnected': '未连接',
+    'panel.status.starting': '正在启动 dsh 运行时…',
+    'panel.status.connected': '已连接 {name}',
+    'panel.status.running': '运行中…',
+    'panel.status.ready': '就绪',
+    'panel.status.readyNewSession': '就绪（新会话）',
+    'panel.status.error': '出错',
+    'panel.status.stopped': '已停止',
+    'panel.status.restarting': '正在重启…',
+    'panel.status.restartFailed': '重启失败',
+    'panel.status.exited': '运行时已退出（code={code}）',
+    'panel.empty.line1': 'DSH Native 尚未连接。',
+    'panel.empty.line2': '直接输入问题并按 Enter，插件会自动启动运行时。',
+    'panel.empty.line3': 'agent 以 vault 为工作目录，可直接读写笔记。',
+    'panel.restored': '已恢复上次的对话记录。DSH 协议不支持跨进程续接上下文，请直接提新问题或点「新会话」。',
+    'panel.runtimeRestarted': '运行时已重启：已自动开启新会话（DSH 协议不支持跨进程续接上下文）',
+    'panel.openPanelCommand': '打开对话面板',
+    'panel.sendSelectionCommand': '把选中内容发给 DSH',
+
+    // ---- 动作按钮 ----
+    'action.retry': '重试',
+    'action.settings': '打开设置',
+    'action.check': '检测环境',
+    'action.restart': '重启运行时',
+    'action.newSession': '开新会话',
+
+    // ---- 错误卡片 ----
+    'err.sessionExists.title': '会话 id 已被占用',
+    'err.sessionExists.hint1': '这通常发生在运行时进程重启后复用了旧会话 id —— DSH 协议不支持跨进程续接会话。',
+    'err.sessionExists.hint2': '插件已经会自动换一个新会话 id 重试；若仍失败，点下面的「开新会话」。',
+    'err.noNode.title': '找不到 node 可执行文件',
+    'err.noNode.hint1': '在设置里把「node 可执行文件」填成绝对路径，例如 C:\\Program Files\\nodejs\\node.exe',
+    'err.noNode.hint2': '确认 Node.js 已安装，且路径没有写错。',
+    'err.noCli.title': '没找到 dsh 的构建产物（bin.js）',
+    'err.noCli.hint1': '在 deepseek-harness 仓库里执行 pnpm install 然后 pnpm run build。',
+    'err.noCli.hint2': '然后在设置里把「dsh CLI 产物」指向 apps/cli/lib/bin.js。',
+    'err.provider.title': 'provider 名称不被识别',
+    'err.provider.hint1': 'provider 必须与 DSH 已注册的适配器一致；deepseek-official 内置可用。',
+    'err.provider.hint2': '检查设置里的 provider / model 拼写。',
+    'err.initTimeout.title': 'initialize 握手超时',
+    'err.initTimeout.hint1': '首次使用 sdk profile 时 DSH 要从随附模板自举，可能需要几十秒到几分钟。',
+    'err.initTimeout.hint2': '也可能是同时在启动多个实例；稍等后重试或重启运行时。',
+    'err.runtimeExited.title': 'dsh 运行时进程退出了',
+    'err.runtimeExited.hint1': '进程可能因为配置错误或环境问题崩溃。',
+    'err.runtimeExited.hint2': '点「重启运行时」可以重新拉起；开了自动重连时插件也会自己重试。',
+    'err.credentials.title': '凭据相关问题',
+    'err.credentials.hint1': 'DSH 的凭据从环境变量、$DSH_HOME/.credentials.yaml 或 .env 解析。',
+    'err.credentials.hint2': '确认已配置可用的 API key；插件本身不读取也不转发密钥。',
+    'err.permission.title': '权限被拒绝',
+    'err.permission.hint1': '检查 node 与 dsh 仓库目录的读取权限。',
+    'err.permission.hint2': 'Windows 上若仓库位于受保护目录，可能被系统策略拦下。',
+    'err.generic.title': '出错了',
+    'err.generic.detailFallback': '（没有更多信息）',
+    'err.generic.hint1': '可以点「检测环境」看各项配置是否正常，或「重启运行时」重来一次。',
+
+    // ---- 自己抛出的错误文案 ----
+    'raised.noCli': '未找到 dsh CLI 产物。请在插件设置里填写 bin.js 的绝对路径。',
+    'raised.notRunning': 'dsh 运行时未运行',
+    'raised.timeout': '{method} 超时（{ms}ms）',
+    'raised.spawnFailed': '无法启动 dsh 子进程：{message}',
+    'raised.exited': 'dsh 运行时已退出（code={code}, signal={signal}）',
+    'raised.stopped': 'dsh 运行时已被用户停止',
+    'raised.serverUnknownError': '未知错误',
+
+    // ---- 环境检测 ----
+    'env.node': 'Node.js',
+    'env.node.ok': '{path} -> {version}',
+    'env.node.fail': '{path} 无法执行：{message}',
+    'env.node.fix': '在设置里把「node 可执行文件」填成绝对路径，例如 C:\\Program Files\\nodejs\\node.exe',
+    'env.cli': 'dsh CLI 产物',
+    'env.cli.missing': '未找到 bin.js',
+    'env.cli.notFoundFile': '文件不存在：{path}',
+    'env.cli.fix': '在 deepseek-harness 仓库里执行 pnpm install 与 pnpm run build，然后在设置里指定 apps/cli/lib/bin.js',
+    'env.workspace': '工作区目录',
+    'env.workspace.notDir': '这个路径不是目录',
+    'env.workspace.missing': '不存在：{path}',
+    'env.workspace.fix': '在设置里改成存在的目录，或留空使用 vault 根目录',
+    'env.home': 'DSH_HOME',
+    'env.home.missing': '尚不存在：{path}',
+    'env.home.fix': '首次启动 sdk profile 时 DSH 会自动创建，无需手动处理',
+    'env.profile': 'profile「{name}」',
+    'env.profile.missing': '尚未初始化：{path}',
+    'env.profile.fix': '首次启动会自动从随附模板初始化，可能耗时几十秒',
+    'env.cred': '模型凭据',
+    'env.cred.env': '检测到环境变量 DEEPSEEK_API_KEY（插件不读取其值）',
+    'env.cred.file': '存在 {path}（插件不读取其内容）',
+    'env.cred.missing': '未在环境变量或 {path} 里发现凭据',
+    'env.cred.fix': '按 DSH 的凭据方式配置 API key（插件本身不接触密钥）',
+    'env.summary.ok': '全部正常。',
+    'env.summary.warn': '{count} 项需要留意（多数首次启动会自动解决）。',
+    'env.summary.fail': '{count} 项失败，按上面的建议处理后重试。',
+    'env.checkFailed': '检测失败：{message}',
+    'env.report.ok': '环境检测：没有发现致命问题（详情见插件设置页）',
+    'env.report.fail': '环境检测：{count} 项失败 —— {names}（详情见插件设置页）',
+
+    // ---- 设置页 ----
+    'set.topDesc': '插件以 sdk profile 启动 dsh 子进程，并用换行分帧的 JSON-RPC 驱动它。留空的路径项会自动探测。',
+    'set.env.heading': '环境',
+    'set.env.checkName': '检测环境',
+    'set.env.checkDesc': '逐项检查 node、dsh 产物、工作区、DSH_HOME、profile 与凭据。只检测，不自动安装任何东西。',
+    'set.env.checkBtn': '开始检测',
+    'set.env.checking': '检测中…',
+    'set.env.cliName': 'dsh CLI 产物（bin.js）',
+    'set.env.cliDesc': '指向仓库里构建好的启动器，例如 <你的仓库>\\apps\\cli\\lib\\bin.js',
+    'set.env.detectBtn': '自动探测',
+    'set.env.detected': '已找到：{path}',
+    'set.env.notDetected': '未在常见位置找到 bin.js，请手动填写',
+    'set.env.nodeName': 'node 可执行文件',
+    'set.env.nodeDesc': '留空则自动探测，仍找不到时回退为 PATH 上的 node。',
+    'set.env.cwdName': '工作区目录（cwd）',
+    'set.env.cwdDesc': '作为 initialize 的 cwd，也就是 agent 的工作区根目录。留空 = vault 根目录；写入被沙箱限制在此目录内。',
+    'set.env.homeName': 'DSH_HOME',
+    'set.env.homeDesc': '留空 = 沿用 dsh 默认值（~/.dsh）。仅当你的配置目录不在默认位置时才需要填写。',
+    'set.conn.heading': '连接与模型路由',
+    'set.conn.providerName': 'provider',
+    'set.conn.providerDesc': '必须与 DSH 已注册的适配器一致；deepseek-official 内置可用。',
+    'set.conn.modelName': 'model',
+    'set.conn.modelDesc': '握手时会由适配器校验该路由；不可用会直接报错，不会静默回退。',
+    'set.conn.effortName': 'reasoning effort',
+    'set.conn.effortDesc': '可选，由适配器持有。留空则用模型默认值。',
+    'set.conn.maxTokensName': 'max tokens',
+    'set.conn.maxTokensDesc': '每次模型输出的上限；0 表示用模型默认值。',
+    'set.conn.testName': '测试连接',
+    'set.conn.testDesc': '启动一次运行时并完成 initialize 握手，用来验证上面的配置。',
+    'set.conn.testBtn': '测试',
+    'set.conn.testing': '测试中…',
+    'set.conn.testOk': '连接成功：{name} v{version}（{ms}ms）',
+    'set.conn.testFail': '连接失败：{title}',
+    'set.interact.heading': '交互',
+    'set.interact.selModeName': '框选发送的内容',
+    'set.interact.selModeDesc': '命令「把选中内容发给 DSH」发什么。发送文件位置引用可让 agent 自己读文件，比贴原文更省 token，也能处理非整行选区。',
+    'set.interact.selModeRef': '只发文件位置引用（推荐）',
+    'set.interact.selModeText': '只发选中的原文',
+    'set.interact.selModeBoth': '引用 + 原文',
+    'set.interact.selActionName': '框选后',
+    'set.interact.selActionDesc': '插入输入框可以让你先补一句要求再发送；直接发送更省事。',
+    'set.interact.selActionInsert': '插入输入框，等我编辑',
+    'set.interact.selActionSend': '直接发送',
+    'set.interact.toolsName': '显示工具调用',
+    'set.interact.toolsDesc': '在对话里显示 🔧 工具名等紧凑活动行。',
+    'set.interact.linkName': '笔记路径可点击',
+    'set.interact.linkDesc': '把回复里出现的 vault 内路径渲染成链接，点击直接在 Obsidian 打开（支持 path.md:行号 定位）。',
+    'set.interact.reconnectName': '崩溃后自动重连',
+    'set.interact.reconnectDesc': '运行时意外退出时自动重试，最多 {max} 次（指数退避）。注意：重连后上下文会重置 —— 协议不支持跨进程续接会话。',
+    'set.lang.heading': '界面',
+    'set.lang.name': '界面语言',
+    'set.lang.desc': '跟随 Obsidian 使用其界面语言；也可以在这里强制指定。',
+    'set.lang.auto': '跟随 Obsidian',
+    'set.lang.zh': '中文',
+    'set.lang.en': 'English',
+    'set.diag.heading': '诊断',
+    'set.diag.copyName': '复制诊断信息',
+    'set.diag.copyDesc': '把上面的解析结果与最近一次握手记录复制到剪贴板，便于排查问题时贴出来。',
+    'set.diag.copyBtn': '复制',
+    'set.diag.copied': '已复制诊断信息',
+    'set.diag.clearName': '清空面板记录',
+    'set.diag.clearDesc': '面板会保留最近 {max} 条对话用于重载后查看（仅记录，不含上下文）。',
+    'set.diag.clearBtn': '清空',
+    'set.diag.cleared': '已清空面板记录',
+
+    // ---- 诊断字段 ----
+    'diag.version': '插件版本',
+    'diag.node': 'node',
+    'diag.cli': 'dsh CLI 产物',
+    'diag.home': 'DSH_HOME',
+    'diag.profile': 'profile',
+    'diag.cwd': '工作区目录',
+    'diag.route': 'provider / model',
+    'diag.effort': 'reasoning effort',
+    'diag.maxTokens': 'max tokens',
+    'diag.lastHandshake': '最近一次握手',
+    'diag.noHandshake': '（本机还没有记录）',
+    'diag.handshakeOk': '成功 · {when}{ms}{server}',
+    'diag.handshakeMs': ' · 耗时 {ms}ms',
+    'diag.handshakeServer': ' · {name} v{version}',
+    'diag.handshakeFail': '失败 · {when} · {error}',
+    'diag.runtime': '面板运行时',
+    'diag.running': '运行中',
+    'diag.notRunning': '未运行',
+    'diag.notFound': '（未找到）',
+    'diag.modelDefault': '（模型默认）',
+
+    // ---- 通知与杂项 ----
+    'notice.noSelection': '没有选中内容',
+    'notice.nothingToSave': '还没有可存入的回复',
+    'notice.noActiveNote': '没有活动笔记，已复制到剪贴板',
+    'notice.savedTo': '已存入 {name}',
+    'notice.openSettingsManually': '请手动打开：设置 → 第三方插件 → DSH Native',
+    'notice.sessionConflict': '会话 id 冲突，已自动换用新会话重试。',
+    'notice.turnEnd': '本轮结束：{kind}{detail}',
+    'notice.turnEndDetail': '（{detail}）',
+    'notice.maxTokens': '达到输出上限',
+    'notice.compacted': '上下文已压缩',
+    'notice.subagentStarted': '↳ 子 agent 启动',
+    'notice.reconnected': '已重连。',
+    'notice.restarted': '运行时已重启。',
+    'notice.reconnectIn': '{seconds} 秒后自动重连（第 {n}/{max} 次）…',
+    'notice.reconnectGaveUp': '已连续重连 {max} 次仍未成功，请点「检测环境」排查。',
+    'notice.error': '出错：{message}',
+    'notice.toolCall': '🔧 {name} {args}',
+    'notice.toolError': '✗ {detail}',
+  },
+
+  en: {
+    // ---- Panel ----
+    'panel.newSession': 'New session',
+    'panel.restart': 'Restart',
+    'panel.insertIntoNote': 'Save to note',
+    'panel.stop': 'Stop',
+    'panel.send': 'Send',
+    'panel.inputPlaceholder': 'Ask something, or let the agent edit your notes… (Enter to send, Shift+Enter for a newline)',
+    'panel.workspaceHint': 'Workspace: {path}',
+    'panel.status.disconnected': 'Not connected',
+    'panel.status.starting': 'Starting the dsh runtime…',
+    'panel.status.connected': 'Connected to {name}',
+    'panel.status.running': 'Running…',
+    'panel.status.ready': 'Ready',
+    'panel.status.readyNewSession': 'Ready (new session)',
+    'panel.status.error': 'Error',
+    'panel.status.stopped': 'Stopped',
+    'panel.status.restarting': 'Restarting…',
+    'panel.status.restartFailed': 'Restart failed',
+    'panel.status.exited': 'Runtime exited (code={code})',
+    'panel.empty.line1': 'DSH Native is not connected yet.',
+    'panel.empty.line2': 'Type a question and press Enter — the plugin starts the runtime for you.',
+    'panel.empty.line3': 'The agent uses your vault as its working directory and can read and write notes directly.',
+    'panel.restored': 'Restored the previous transcript. The DSH protocol cannot resume context across processes, so ask a new question or click "New session".',
+    'panel.runtimeRestarted': 'The runtime restarted, so a new session was started (the DSH protocol cannot resume context across processes)',
+    'panel.openPanelCommand': 'Open chat panel',
+    'panel.sendSelectionCommand': 'Send selection to DSH',
+
+    // ---- Action buttons ----
+    'action.retry': 'Retry',
+    'action.settings': 'Open settings',
+    'action.check': 'Check environment',
+    'action.restart': 'Restart runtime',
+    'action.newSession': 'New session',
+
+    // ---- Error cards ----
+    'err.sessionExists.title': 'Session id already in use',
+    'err.sessionExists.hint1': 'This usually happens when an old session id is reused after the runtime process restarted — the DSH protocol cannot resume a session across processes.',
+    'err.sessionExists.hint2': 'The plugin already retries with a fresh session id automatically; if it still fails, click "New session" below.',
+    'err.noNode.title': 'node executable not found',
+    'err.noNode.hint1': 'Set "node executable" in the settings to an absolute path, for example C:\\Program Files\\nodejs\\node.exe',
+    'err.noNode.hint2': 'Make sure Node.js is installed and the path is spelled correctly.',
+    'err.noCli.title': 'dsh build artifact (bin.js) not found',
+    'err.noCli.hint1': 'In the deepseek-harness repository, run pnpm install and then pnpm run build.',
+    'err.noCli.hint2': 'Then point "dsh CLI artifact" in the settings at apps/cli/lib/bin.js.',
+    'err.provider.title': 'Provider name not recognized',
+    'err.provider.hint1': 'The provider must match an adapter registered in DSH; deepseek-official is built in.',
+    'err.provider.hint2': 'Check the provider / model spelling in the settings.',
+    'err.initTimeout.title': 'initialize handshake timed out',
+    'err.initTimeout.hint1': 'The first use of the sdk profile bootstraps it from a bundled template, which can take tens of seconds to a few minutes.',
+    'err.initTimeout.hint2': 'It can also be several instances starting at once; wait a moment, then retry or restart the runtime.',
+    'err.runtimeExited.title': 'The dsh runtime process exited',
+    'err.runtimeExited.hint1': 'The process may have crashed because of a configuration or environment problem.',
+    'err.runtimeExited.hint2': 'Click "Restart runtime" to bring it back; with auto-reconnect on, the plugin also retries by itself.',
+    'err.credentials.title': 'Credential problem',
+    'err.credentials.hint1': 'DSH resolves credentials from environment variables, $DSH_HOME/.credentials.yaml, or .env.',
+    'err.credentials.hint2': 'Make sure a working API key is configured; the plugin never reads or forwards your keys.',
+    'err.permission.title': 'Permission denied',
+    'err.permission.hint1': 'Check read permissions on node and on the dsh repository directory.',
+    'err.permission.hint2': 'On Windows, a repository inside a protected directory can be blocked by system policy.',
+    'err.generic.title': 'Something went wrong',
+    'err.generic.detailFallback': '(no further details)',
+    'err.generic.hint1': 'Click "Check environment" to verify your configuration, or "Restart runtime" to start over.',
+
+    // ---- Errors we raise ourselves ----
+    'raised.noCli': 'dsh CLI artifact not found. Set the absolute path to bin.js in the plugin settings.',
+    'raised.notRunning': 'The dsh runtime is not running',
+    'raised.timeout': '{method} timed out ({ms}ms)',
+    'raised.spawnFailed': 'Could not start the dsh subprocess: {message}',
+    'raised.exited': 'The dsh runtime exited (code={code}, signal={signal})',
+    'raised.stopped': 'The dsh runtime was stopped by the user',
+    'raised.serverUnknownError': 'unknown error',
+
+    // ---- Environment check ----
+    'env.node': 'Node.js',
+    'env.node.ok': '{path} -> {version}',
+    'env.node.fail': 'Cannot execute {path}: {message}',
+    'env.node.fix': 'Set "node executable" in the settings to an absolute path, for example C:\\Program Files\\nodejs\\node.exe',
+    'env.cli': 'dsh CLI artifact',
+    'env.cli.missing': 'bin.js not found',
+    'env.cli.notFoundFile': 'File does not exist: {path}',
+    'env.cli.fix': 'In the deepseek-harness repository run pnpm install and pnpm run build, then point the settings at apps/cli/lib/bin.js',
+    'env.workspace': 'Workspace directory',
+    'env.workspace.notDir': 'This path is not a directory',
+    'env.workspace.missing': 'Does not exist: {path}',
+    'env.workspace.fix': 'Change it to an existing directory in the settings, or leave it empty to use the vault root',
+    'env.home': 'DSH_HOME',
+    'env.home.missing': 'Does not exist yet: {path}',
+    'env.home.fix': 'DSH creates it automatically on the first start of the sdk profile; nothing to do',
+    'env.profile': 'profile "{name}"',
+    'env.profile.missing': 'Not initialized yet: {path}',
+    'env.profile.fix': 'It is initialized from the bundled template on first start, which can take tens of seconds',
+    'env.cred': 'Model credentials',
+    'env.cred.env': 'Found the DEEPSEEK_API_KEY environment variable (the plugin does not read its value)',
+    'env.cred.file': 'Found {path} (the plugin does not read its contents)',
+    'env.cred.missing': 'No credentials found in the environment or at {path}',
+    'env.cred.fix': 'Configure an API key the way DSH expects (the plugin itself never touches keys)',
+    'env.summary.ok': 'Everything looks good.',
+    'env.summary.warn': '{count} item(s) need attention (most resolve themselves on first start).',
+    'env.summary.fail': '{count} item(s) failed — apply the suggestions above and try again.',
+    'env.checkFailed': 'Check failed: {message}',
+    'env.report.ok': 'Environment check: no fatal problems found (see the plugin settings for details)',
+    'env.report.fail': 'Environment check: {count} failed — {names} (see the plugin settings for details)',
+
+    // ---- Settings ----
+    'set.topDesc': 'The plugin starts a dsh subprocess with the sdk profile and drives it over newline-framed JSON-RPC. Empty paths are auto-detected.',
+    'set.env.heading': 'Environment',
+    'set.env.checkName': 'Check environment',
+    'set.env.checkDesc': 'Checks node, the dsh artifact, the workspace, DSH_HOME, the profile, and credentials. Detection only — nothing is installed automatically.',
+    'set.env.checkBtn': 'Run check',
+    'set.env.checking': 'Checking…',
+    'set.env.cliName': 'dsh CLI artifact (bin.js)',
+    'set.env.cliDesc': 'Points at the built launcher in your checkout, e.g. <your repo>\\apps\\cli\\lib\\bin.js',
+    'set.env.detectBtn': 'Auto-detect',
+    'set.env.detected': 'Found: {path}',
+    'set.env.notDetected': 'bin.js was not found in the usual locations — please enter the path manually',
+    'set.env.nodeName': 'node executable',
+    'set.env.nodeDesc': 'Leave empty to auto-detect; falls back to node on your PATH.',
+    'set.env.cwdName': 'Workspace directory (cwd)',
+    'set.env.cwdDesc': 'Passed as the initialize cwd — the agent\'s workspace root. Empty = vault root. Writes are confined to this directory by the sandbox.',
+    'set.env.homeName': 'DSH_HOME',
+    'set.env.homeDesc': 'Empty = the dsh default (~/.dsh). Only needed when your config directory is somewhere else.',
+    'set.conn.heading': 'Connection and model routing',
+    'set.conn.providerName': 'provider',
+    'set.conn.providerDesc': 'Must match an adapter registered in DSH; deepseek-official is built in.',
+    'set.conn.modelName': 'model',
+    'set.conn.modelDesc': 'The route is validated by the adapter during the handshake; an unavailable route errors out instead of silently falling back.',
+    'set.conn.effortName': 'reasoning effort',
+    'set.conn.effortDesc': 'Optional and adapter-owned. Empty uses the model default.',
+    'set.conn.maxTokensName': 'max tokens',
+    'set.conn.maxTokensDesc': 'Output cap per model request; 0 uses the model default.',
+    'set.conn.testName': 'Test connection',
+    'set.conn.testDesc': 'Starts the runtime once and completes the initialize handshake to verify the settings above.',
+    'set.conn.testBtn': 'Test',
+    'set.conn.testing': 'Testing…',
+    'set.conn.testOk': 'Connected: {name} v{version} ({ms}ms)',
+    'set.conn.testFail': 'Connection failed: {title}',
+    'set.interact.heading': 'Interaction',
+    'set.interact.selModeName': 'Content sent on selection',
+    'set.interact.selModeDesc': 'What the "Send selection to DSH" command sends. Sending a file location reference lets the agent read the file itself — cheaper in tokens and precise for partial-line selections.',
+    'set.interact.selModeRef': 'File location reference only (recommended)',
+    'set.interact.selModeText': 'Selected text only',
+    'set.interact.selModeBoth': 'Reference + text',
+    'set.interact.selActionName': 'After selecting',
+    'set.interact.selActionDesc': 'Inserting into the input box lets you add an instruction before sending; sending immediately is quicker.',
+    'set.interact.selActionInsert': 'Insert into the input box for editing',
+    'set.interact.selActionSend': 'Send immediately',
+    'set.interact.toolsName': 'Show tool calls',
+    'set.interact.toolsDesc': 'Show compact activity lines such as 🔧 tool names in the conversation.',
+    'set.interact.linkName': 'Clickable note paths',
+    'set.interact.linkDesc': 'Render vault paths in replies as links that open in Obsidian (supports path.md:line for jumping to a line).',
+    'set.interact.reconnectName': 'Auto-reconnect after a crash',
+    'set.interact.reconnectDesc': 'Retries up to {max} times with exponential backoff when the runtime exits unexpectedly. Note: context resets after a reconnect — the protocol cannot resume a session across processes.',
+    'set.lang.heading': 'Interface',
+    'set.lang.name': 'Interface language',
+    'set.lang.desc': 'Follow Obsidian to use its interface language, or force one here.',
+    'set.lang.auto': 'Follow Obsidian',
+    'set.lang.zh': '中文',
+    'set.lang.en': 'English',
+    'set.diag.heading': 'Diagnostics',
+    'set.diag.copyName': 'Copy diagnostics',
+    'set.diag.copyDesc': 'Copies the resolved values above plus the most recent handshake record, handy when reporting a problem.',
+    'set.diag.copyBtn': 'Copy',
+    'set.diag.copied': 'Diagnostics copied',
+    'set.diag.clearName': 'Clear panel transcript',
+    'set.diag.clearDesc': 'The panel keeps the most recent {max} messages so you can read them after a reload (transcript only, no context).',
+    'set.diag.clearBtn': 'Clear',
+    'set.diag.cleared': 'Panel transcript cleared',
+
+    // ---- Diagnostics fields ----
+    'diag.version': 'Plugin version',
+    'diag.node': 'node',
+    'diag.cli': 'dsh CLI artifact',
+    'diag.home': 'DSH_HOME',
+    'diag.profile': 'profile',
+    'diag.cwd': 'Workspace directory',
+    'diag.route': 'provider / model',
+    'diag.effort': 'reasoning effort',
+    'diag.maxTokens': 'max tokens',
+    'diag.lastHandshake': 'Last handshake',
+    'diag.noHandshake': '(no record on this machine yet)',
+    'diag.handshakeOk': 'OK · {when}{ms}{server}',
+    'diag.handshakeMs': ' · took {ms}ms',
+    'diag.handshakeServer': ' · {name} v{version}',
+    'diag.handshakeFail': 'Failed · {when} · {error}',
+    'diag.runtime': 'Panel runtime',
+    'diag.running': 'Running',
+    'diag.notRunning': 'Not running',
+    'diag.notFound': '(not found)',
+    'diag.modelDefault': '(model default)',
+
+    // ---- Notices and misc ----
+    'notice.noSelection': 'Nothing is selected',
+    'notice.nothingToSave': 'There is no reply to save yet',
+    'notice.noActiveNote': 'No active note — copied to the clipboard',
+    'notice.savedTo': 'Saved to {name}',
+    'notice.openSettingsManually': 'Please open manually: Settings → Community plugins → DSH Native',
+    'notice.sessionConflict': 'Session id conflict — retrying with a new session.',
+    'notice.turnEnd': 'Turn ended: {kind}{detail}',
+    'notice.turnEndDetail': ' ({detail})',
+    'notice.maxTokens': 'output limit reached',
+    'notice.compacted': 'Context compacted',
+    'notice.subagentStarted': '↳ subagent started',
+    'notice.reconnected': 'Reconnected.',
+    'notice.restarted': 'Runtime restarted.',
+    'notice.reconnectIn': 'Reconnecting in {seconds}s (attempt {n}/{max})…',
+    'notice.reconnectGaveUp': 'Still failing after {max} reconnect attempts — try "Check environment".',
+    'notice.error': 'Error: {message}',
+    'notice.toolCall': '🔧 {name} {args}',
+    'notice.toolError': '✗ {detail}',
+  },
+}
+
+/** 把语言标签归一成 'zh' 或 'en'。 */
+function normalizeLanguage(raw) {
+  return String(raw || '').toLowerCase().startsWith('zh') ? 'zh' : 'en'
+}
+
+/** 读 Obsidian 的界面语言。 */
+function detectLanguage() {
+  try {
+    const stored = window.localStorage.getItem('language')
+    if (stored) return normalizeLanguage(stored)
+  } catch {
+    /* 拿不到就用下面的兜底 */
+  }
+  try {
+    if (typeof navigator !== 'undefined' && navigator.language) return normalizeLanguage(navigator.language)
+  } catch {
+    /* 忽略 */
+  }
+  return 'en'
+}
+
+/** 当前生效的语言（模块级，渲染时读取）。 */
+let activeLang = 'en'
+
+/**
+ * 设置语言。
+ * @param {'auto'|'zh'|'en'} [preference]
+ * @returns {'zh'|'en'} 最终生效的语言
+ */
+function setLanguage(preference) {
+  if (preference === 'zh' || preference === 'en') activeLang = preference
+  else if (preference === undefined || preference === 'auto') activeLang = detectLanguage()
+  else activeLang = normalizeLanguage(preference)
+  return activeLang
+}
+
+/** 当前生效的语言。 */
+function getLanguage() {
+  return activeLang
+}
+
+/**
+ * 取一条文案，并把 `{name}` 占位符替换掉。
+ * @param {string} key
+ * @param {Record<string, unknown>} [vars]
+ * @returns {string}
+ */
+function t(key, vars) {
+  const dict = DICT[activeLang] || DICT.en
+  const raw = dict[key] !== undefined ? dict[key] : DICT.en[key] !== undefined ? DICT.en[key] : key
+  if (!vars) return raw
+  let text = raw
+  for (const name of Object.keys(vars)) {
+    text = text.split(`{${name}}`).join(String(vars[name]))
+  }
+  return text
+}
+
+/** 带 code 的错误，便于与界面语言解耦地识别。 */
+function codedError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
+/* ------------------------------------------------------------------ *
+ * 基础工具
+ * ------------------------------------------------------------------ */
 
 /** 新会话 id。服务端会用这个 id 调 agents.create，因此必须全局唯一。 */
 function mintSessionId() {
@@ -186,17 +704,21 @@ function execCapture(file, args, timeoutMs) {
  * ------------------------------------------------------------------ */
 
 /** 错误卡片上动作按钮的文案。 */
-const ACTION_LABELS = {
-  retry: '重试',
-  settings: '打开设置',
-  check: '检测环境',
-  restart: '重启运行时',
-  newSession: '开新会话',
+function actionLabel(action) {
+  switch (action) {
+    case 'retry': return t('action.retry')
+    case 'settings': return t('action.settings')
+    case 'check': return t('action.check')
+    case 'restart': return t('action.restart')
+    case 'newSession': return t('action.newSession')
+    default: return ''
+  }
 }
 
 /**
  * 把原始错误翻译成「标题 + 说明 + 排查建议 + 可点动作」。
  *
+ * 自己抛的错误先按 `code` 判定（与界面语言无关），服务端返回的错误再按正则匹配。
  * 用户看到 `spawn ENOENT` 是没法自救的，得告诉他到底缺什么、下一步点哪里。
  *
  * @param {unknown} error
@@ -205,107 +727,84 @@ const ACTION_LABELS = {
 function explainError(error) {
   const message = error && error.message ? String(error.message) : String(error || '')
   const lower = message.toLowerCase()
+  const code = error && typeof error === 'object' ? error.code : undefined
 
   if (isSessionExistsError(error)) {
     return {
-      title: '会话 id 已被占用',
+      title: t('err.sessionExists.title'),
       detail: message,
-      hints: [
-        '这通常发生在运行时进程重启后复用了旧会话 id —— DSH 协议不支持跨进程续接会话。',
-        '插件已经会自动换一个新会话 id 重试；若仍失败，点下面的「开新会话」。',
-      ],
+      hints: [t('err.sessionExists.hint1'), t('err.sessionExists.hint2')],
       actions: ['newSession', 'restart'],
     }
   }
 
-  if (/enoent/.test(lower)) {
+  if (code === ERR.noCli) {
     return {
-      title: '找不到 node 可执行文件',
+      title: t('err.noCli.title'),
       detail: message,
-      hints: [
-        '在设置里把「node 可执行文件」填成绝对路径，例如 C:\\Program Files\\nodejs\\node.exe',
-        '确认 Node.js 已安装，且路径没有写错。',
-      ],
+      hints: [t('err.noCli.hint1'), t('err.noCli.hint2')],
       actions: ['settings', 'check'],
     }
   }
 
-  if (/未找到 dsh cli 产物/.test(lower)) {
+  if (code === ERR.spawnFailed || /enoent/.test(lower)) {
     return {
-      title: '没找到 dsh 的构建产物（bin.js）',
+      title: t('err.noNode.title'),
       detail: message,
-      hints: [
-        '在 deepseek-harness 仓库里执行 pnpm install 然后 pnpm run build。',
-        '然后在设置里把「dsh CLI 产物」指向 apps/cli/lib/bin.js。',
-      ],
+      hints: [t('err.noNode.hint1'), t('err.noNode.hint2')],
       actions: ['settings', 'check'],
+    }
+  }
+
+  if (code === ERR.timeout) {
+    return {
+      title: t('err.initTimeout.title'),
+      detail: message,
+      hints: [t('err.initTimeout.hint1'), t('err.initTimeout.hint2')],
+      actions: ['restart', 'check'],
+    }
+  }
+
+  if (code === ERR.exited || code === ERR.stopped) {
+    return {
+      title: t('err.runtimeExited.title'),
+      detail: message,
+      hints: [t('err.runtimeExited.hint1'), t('err.runtimeExited.hint2')],
+      actions: ['restart', 'check'],
     }
   }
 
   if (/no adapter registered for provider/.test(lower)) {
     return {
-      title: 'provider 名称不被识别',
+      title: t('err.provider.title'),
       detail: message,
-      hints: [
-        'provider 必须与 DSH 已注册的适配器一致；deepseek-official 内置可用。',
-        '检查设置里的 provider / model 拼写。',
-      ],
+      hints: [t('err.provider.hint1'), t('err.provider.hint2')],
       actions: ['settings'],
     }
   }
 
-  if (/initialize 超时/.test(message)) {
+  if (/credential|api key|unauthorized|401|authentication/.test(lower)) {
     return {
-      title: 'initialize 握手超时',
+      title: t('err.credentials.title'),
       detail: message,
-      hints: [
-        '首次使用 sdk profile 时 DSH 要从随附模板自举，可能需要几十秒到几分钟。',
-        '也可能是同时在启动多个实例；稍等后重试或重启运行时。',
-      ],
-      actions: ['restart', 'check'],
-    }
-  }
-
-  if (/运行时已退出/.test(message)) {
-    return {
-      title: 'dsh 运行时进程退出了',
-      detail: message,
-      hints: [
-        '进程可能因为配置错误或环境问题崩溃。',
-        '点「重启运行时」可以重新拉起；开了自动重连时插件也会自己重试。',
-      ],
-      actions: ['restart', 'check'],
-    }
-  }
-
-  if (/credential|api key|unauthorized|401|authentication/i.test(message)) {
-    return {
-      title: '凭据相关问题',
-      detail: message,
-      hints: [
-        'DSH 的凭据从环境变量、$DSH_HOME/.credentials.yaml 或 .env 解析。',
-        '确认已配置可用的 API key；插件本身不读取也不转发密钥。',
-      ],
+      hints: [t('err.credentials.hint1'), t('err.credentials.hint2')],
       actions: ['check'],
     }
   }
 
   if (/eperm|eacces/.test(lower)) {
     return {
-      title: '权限被拒绝',
+      title: t('err.permission.title'),
       detail: message,
-      hints: [
-        '检查 node 与 dsh 仓库目录的读取权限。',
-        'Windows 上若仓库位于受保护目录，可能被系统策略拦下。',
-      ],
+      hints: [t('err.permission.hint1'), t('err.permission.hint2')],
       actions: ['check'],
     }
   }
 
   return {
-    title: '出错了',
-    detail: message || '（没有更多信息）',
-    hints: ['可以点「检测环境」看各项配置是否正常，或「重启运行时」重来一次。'],
+    title: t('err.generic.title'),
+    detail: message || t('err.generic.detailFallback'),
+    hints: [t('err.generic.hint1')],
     actions: ['retry', 'restart', 'check'],
   }
 }
@@ -333,9 +832,31 @@ function buildSelectionPayload(editor, file, mode) {
 
   const from = editor.getCursor('from')
   const to = editor.getCursor('to')
-  const reference = `[选中片段] 文件：${file.path}｜范围：第 ${from.line + 1} 行第 ${from.ch + 1} 列 → 第 ${to.line + 1} 行第 ${to.ch + 1} 列（共 ${selected.length} 字符）｜请读取该文件对应范围后处理`
+  const reference = buildSelectionReference(file.path, from, to, selected.length)
 
-  return mode === 'both' ? `${reference}\n\n原文如下：\n${selected}` : reference
+  return mode === 'both' ? `${reference}\n\n${selected}` : reference
+}
+
+/**
+ * 构造那行「文件 + 行:列 + 字数」的引用。
+ *
+ * 中英各一套措辞，便于模型在两种语境下都读懂。
+ *
+ * @param {string} filePath
+ * @param {{line: number, ch: number}} from
+ * @param {{line: number, ch: number}} to
+ * @param {number} length
+ * @returns {string}
+ */
+function buildSelectionReference(filePath, from, to, length) {
+  const startLine = from.line + 1
+  const startCol = from.ch + 1
+  const endLine = to.line + 1
+  const endCol = to.ch + 1
+  if (activeLang === 'zh') {
+    return `[选中片段] 文件：${filePath}｜范围：第 ${startLine} 行第 ${startCol} 列 → 第 ${endLine} 行第 ${endCol} 列（共 ${length} 字符）｜请读取该文件对应范围后处理`
+  }
+  return `[selected passage] file: ${filePath} | range: line ${startLine} col ${startCol} -> line ${endLine} col ${endCol} (${length} chars) | read that range from the file and handle it`
 }
 
 /* ------------------------------------------------------------------ *
@@ -515,11 +1036,11 @@ class DshRuntime {
       if (this.options.onStderr) this.options.onStderr(chunk)
     })
     this.child.on('error', (error) => {
-      this._failAll(new Error(`无法启动 dsh 子进程：${error.message}`))
+      this._failAll(codedError(ERR.spawnFailed, t('raised.spawnFailed', { message: error.message })))
     })
     this.child.on('exit', (code, signal) => {
       const wasStopped = this.stopped
-      this._failAll(new Error(`dsh 运行时已退出（code=${code}, signal=${signal}）`))
+      this._failAll(codedError(ERR.exited, t('raised.exited', { code, signal })))
       if (!wasStopped && this.options.onExit) this.options.onExit(code, signal)
     })
 
@@ -551,13 +1072,15 @@ class DshRuntime {
   request(method, params, timeoutMs) {
     return new Promise((resolve, reject) => {
       if (!this.alive || !this.child) {
-        reject(new Error('dsh 运行时未运行'))
+        reject(codedError(ERR.notRunning, t('raised.notRunning')))
         return
       }
       const id = this.nextId++
       const timer = timeoutMs
         ? setTimeout(() => {
-            if (this.pending.delete(id)) reject(new Error(`${method} 超时（${timeoutMs}ms）`))
+            if (this.pending.delete(id)) {
+              reject(codedError(ERR.timeout, t('raised.timeout', { method, ms: timeoutMs })))
+            }
           }, timeoutMs)
         : null
       this.pending.set(id, { resolve, reject, timer })
@@ -604,7 +1127,7 @@ class DshRuntime {
       clearTimeout(termTimer)
       clearTimeout(killTimer)
     })
-    this._failAll(new Error('dsh 运行时已被用户停止'))
+    this._failAll(codedError(ERR.stopped, t('raised.stopped')))
   }
 
   /** 处理 stdout 分片，按换行切帧。 */
@@ -637,7 +1160,7 @@ class DshRuntime {
       if (entry.timer) clearTimeout(entry.timer)
       if (message.error) {
         const code = message.error.code === undefined ? '?' : message.error.code
-        const text = message.error.message === undefined ? '未知错误' : message.error.message
+        const text = message.error.message === undefined ? t('raised.serverUnknownError') : message.error.message
         entry.reject(new Error(`[${code}] ${text}`))
       } else {
         entry.resolve(message.result)
@@ -707,18 +1230,18 @@ class DshView extends ItemView {
     const header = root.createDiv({ cls: 'dsh-header' })
     const status = header.createDiv({ cls: 'dsh-status' })
     this.dotEl = status.createDiv({ cls: 'dsh-dot' })
-    this.statusEl = status.createSpan({ text: '未连接' })
+    this.statusEl = status.createSpan({ text: t('panel.status.disconnected') })
 
     this.actionsEl = header.createDiv({ cls: 'dsh-header-actions' })
 
-    const newBtn = this.actionsEl.createEl('button', { text: '新会话' })
-    newBtn.onclick = () => this.newSession()
-    const restartBtn = this.actionsEl.createEl('button', { text: '重启' })
-    restartBtn.onclick = () => void this.restartRuntime()
-    const insertBtn = this.actionsEl.createEl('button', { text: '存入笔记' })
-    insertBtn.onclick = () => void this.insertIntoNote()
-    const stopBtn = this.actionsEl.createEl('button', { text: '停止' })
-    stopBtn.onclick = () => this.stopRuntime()
+    this.btnNew = this.actionsEl.createEl('button', { text: t('panel.newSession') })
+    this.btnNew.onclick = () => this.newSession()
+    this.btnRestart = this.actionsEl.createEl('button', { text: t('panel.restart') })
+    this.btnRestart.onclick = () => void this.restartRuntime()
+    this.btnInsert = this.actionsEl.createEl('button', { text: t('panel.insertIntoNote') })
+    this.btnInsert.onclick = () => void this.insertIntoNote()
+    this.btnStop = this.actionsEl.createEl('button', { text: t('panel.stop') })
+    this.btnStop.onclick = () => this.stopRuntime()
 
     // ---- 消息区 ----
     this.messagesEl = root.createDiv({ cls: 'dsh-messages' })
@@ -728,7 +1251,7 @@ class DshView extends ItemView {
     const inputRow = root.createDiv({ cls: 'dsh-input-row' })
     this.inputEl = inputRow.createEl('textarea', {
       cls: 'dsh-input',
-      attr: { placeholder: '问点什么，或让 agent 直接改你的笔记…（Enter 发送，Shift+Enter 换行）' },
+      attr: { placeholder: t('panel.inputPlaceholder') },
     })
     this.inputEl.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && !event.shiftKey) {
@@ -737,10 +1260,10 @@ class DshView extends ItemView {
       }
     })
     const actions = inputRow.createDiv({ cls: 'dsh-input-actions' })
-    const hint = actions.createDiv({ cls: 'dsh-hint' })
-    hint.setText(`工作区：${this.plugin.getWorkspaceRoot()}`)
-    const sendBtn = actions.createEl('button', { text: '发送', cls: 'mod-cta' })
-    sendBtn.onclick = () => void this.submit()
+    this.hintEl = actions.createDiv({ cls: 'dsh-hint' })
+    this.hintEl.setText(t('panel.workspaceHint', { path: this.plugin.getWorkspaceRoot() }))
+    this.sendBtn = actions.createEl('button', { text: t('panel.send'), cls: 'mod-cta' })
+    this.sendBtn.onclick = () => void this.submit()
   }
 
   async onClose() {
@@ -749,15 +1272,28 @@ class DshView extends ItemView {
     await this.plugin.flushTranscript()
   }
 
+  /** 语言改变后刷新面板上的静态文案。 */
+  applyLanguage() {
+    if (!this.statusEl) return
+    if (this.btnNew) this.btnNew.setText(t('panel.newSession'))
+    if (this.btnRestart) this.btnRestart.setText(t('panel.restart'))
+    if (this.btnInsert) this.btnInsert.setText(t('panel.insertIntoNote'))
+    if (this.btnStop) this.btnStop.setText(t('panel.stop'))
+    if (this.sendBtn) this.sendBtn.setText(t('panel.send'))
+    if (this.inputEl) this.inputEl.setAttribute('placeholder', t('panel.inputPlaceholder'))
+    if (this.hintEl) this.hintEl.setText(t('panel.workspaceHint', { path: this.plugin.getWorkspaceRoot() }))
+    if (!this.runtime || !this.runtime.alive) this.setStatus(t('panel.status.disconnected'), null)
+  }
+
   /* ---------------- 渲染 ---------------- */
 
   /** 面板内的空状态提示。 */
   renderEmpty() {
     this.messagesEl.empty()
     const empty = this.messagesEl.createDiv({ cls: 'dsh-empty' })
-    empty.createDiv({ text: 'DSH Native 尚未连接。' })
-    empty.createDiv({ text: '直接输入问题并按 Enter，插件会自动启动运行时。' })
-    empty.createDiv({ text: 'agent 以 vault 为工作目录，可直接读写笔记。' })
+    empty.createDiv({ text: t('panel.empty.line1') })
+    empty.createDiv({ text: t('panel.empty.line2') })
+    empty.createDiv({ text: t('panel.empty.line3') })
   }
 
   /** 从持久化数据恢复上次的对话记录（仅用于阅读）。 */
@@ -766,7 +1302,7 @@ class DshView extends ItemView {
     if (!saved || !Array.isArray(saved.messages) || saved.messages.length === 0) return false
     this.transcript = saved.messages.slice()
     this.messagesEl.empty()
-    this.appendNotice('已恢复上次的对话记录。DSH 协议不支持跨进程续接上下文，请直接提新问题或点「新会话」。')
+    this.appendNotice(t('panel.restored'))
     for (const entry of this.transcript) this.renderEntry(entry)
     return true
   }
@@ -855,6 +1391,7 @@ class DshView extends ItemView {
     }
   }
 
+  /** 画一行工具活动。 */
   appendToolLine(text, isError) {
     const el = this.messagesEl.createDiv({ cls: isError ? 'dsh-tool is-error' : 'dsh-tool' })
     el.setText(text)
@@ -883,7 +1420,7 @@ class DshView extends ItemView {
     if (info.actions.length > 0) {
       const row = card.createDiv({ cls: 'dsh-error-actions' })
       for (const action of info.actions) {
-        const label = ACTION_LABELS[action]
+        const label = actionLabel(action)
         if (!label) continue
         const button = row.createEl('button', { text: label })
         button.onclick = () => void this.runErrorAction(action)
@@ -906,7 +1443,7 @@ class DshView extends ItemView {
           this.app.setting.open()
           this.app.setting.openTabById(this.plugin.manifest.id)
         } catch {
-          new Notice('请手动打开：设置 → 第三方插件 → DSH Native')
+          new Notice(t('notice.openSettingsManually'))
         }
         return
       case 'check':
@@ -933,14 +1470,14 @@ class DshView extends ItemView {
     const nodePath = this.plugin.getNodePath()
     const cliPath = this.plugin.getCliPath()
     if (!cliPath) {
-      throw new Error('未找到 dsh CLI 产物。请在插件设置里填写 bin.js 的绝对路径。')
+      throw codedError(ERR.noCli, t('raised.noCli'))
     }
 
     // 新进程无法复用旧会话 id（会话已持久化，create 会拒绝），必须换新 id
     const wasRunning = this.sessionUsed
     this.sessionId = mintSessionId()
     if (wasRunning) {
-      this.pushEntry({ role: 'notice', text: '运行时已重启：已自动开启新会话（DSH 协议不支持跨进程续接上下文）' })
+      this.pushEntry({ role: 'notice', text: t('panel.runtimeRestarted') })
     }
 
     const runtime = new DshRuntime({
@@ -958,12 +1495,12 @@ class DshView extends ItemView {
       onExit: (code) => this.onRuntimeExit(code),
     })
 
-    this.setStatus('正在启动 dsh 运行时…', 'running')
+    this.setStatus(t('panel.status.starting'), 'running')
     const info = await runtime.start()
     this.runtime = runtime
     this.sessionUsed = false
     this.reconnectAttempts = 0
-    this.setStatus(`已连接 ${info.name}`, null)
+    this.setStatus(t('panel.status.connected', { name: info.name }), null)
     await this.plugin.recordHandshake({
       ok: true,
       at: Date.now(),
@@ -980,19 +1517,26 @@ class DshView extends ItemView {
   /** 运行时意外退出。 */
   onRuntimeExit(code) {
     this.runtime = null
-    this.setStatus(`运行时已退出（code=${code}）`, 'error')
-    this.pushEntry({ role: 'notice', text: `dsh 运行时已退出（code=${code}）` })
-    this.showErrorCard(new Error(`dsh 运行时已退出（code=${code}）`))
-    void this.plugin.recordHandshake({ ok: false, at: Date.now(), error: `运行时退出 code=${code}` })
+    this.setStatus(t('panel.status.exited', { code }), 'error')
+    this.pushEntry({ role: 'notice', text: t('panel.status.exited', { code }) })
+    this.showErrorCard(codedError(ERR.exited, t('raised.exited', { code, signal: null })))
+    void this.plugin.recordHandshake({ ok: false, at: Date.now(), error: `exit code=${code}` })
 
     if (!this.plugin.settings.autoReconnect || this.userStopped) return
     if (this.reconnectAttempts >= MAX_RECONNECT) {
-      this.pushEntry({ role: 'notice', text: `已连续重连 ${MAX_RECONNECT} 次仍未成功，请点「检测环境」排查。` })
+      this.pushEntry({ role: 'notice', text: t('notice.reconnectGaveUp', { max: MAX_RECONNECT }) })
       return
     }
     this.reconnectAttempts += 1
     const delayMs = 1000 * 2 ** (this.reconnectAttempts - 1)
-    this.pushEntry({ role: 'notice', text: `${Math.round(delayMs / 1000)} 秒后自动重连（第 ${this.reconnectAttempts}/${MAX_RECONNECT} 次）…` })
+    this.pushEntry({
+      role: 'notice',
+      text: t('notice.reconnectIn', {
+        seconds: Math.round(delayMs / 1000),
+        n: this.reconnectAttempts,
+        max: MAX_RECONNECT,
+      }),
+    })
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       void this.autoReconnect()
@@ -1004,7 +1548,7 @@ class DshView extends ItemView {
     if (this.userStopped) return
     try {
       await this.ensureRuntime()
-      this.pushEntry({ role: 'notice', text: '已重连。' })
+      this.pushEntry({ role: 'notice', text: t('notice.reconnected') })
     } catch (error) {
       this.showErrorCard(error)
       this.onRuntimeExit('reconnect-failed')
@@ -1028,12 +1572,12 @@ class DshView extends ItemView {
       this.runtime.stop()
       this.runtime = null
     }
-    this.setStatus('正在重启…', 'running')
+    this.setStatus(t('panel.status.restarting'), 'running')
     try {
       await this.ensureRuntime()
-      this.pushEntry({ role: 'notice', text: '运行时已重启。' })
+      this.pushEntry({ role: 'notice', text: t('notice.restarted') })
     } catch (error) {
-      this.setStatus('重启失败', 'error')
+      this.setStatus(t('panel.status.restartFailed'), 'error')
       this.showErrorCard(error)
     }
   }
@@ -1047,7 +1591,7 @@ class DshView extends ItemView {
       this.runtime.stop()
       this.runtime = null
     }
-    this.setStatus('已停止', null)
+    this.setStatus(t('panel.status.stopped'), null)
   }
 
   /* ---------------- 通知与事件 ---------------- */
@@ -1065,10 +1609,10 @@ class DshView extends ItemView {
     if (method === 'session.status') {
       if (params.sessionId !== this.sessionId) return
       if (params.status === 'running') {
-        this.setStatus('运行中…', 'running')
+        this.setStatus(t('panel.status.running'), 'running')
         if (this.turnWaiter) this.turnWaiter.sawRunning = true
       } else if (params.status === 'idle') {
-        this.setStatus('就绪', null)
+        this.setStatus(t('panel.status.ready'), null)
         this.maybeFinishTurn()
       }
       return
@@ -1076,7 +1620,7 @@ class DshView extends ItemView {
 
     if (method === 'subagent.started') {
       if (params.parentSessionId !== this.sessionId && params.childSessionId !== this.sessionId) return
-      this.pushEntry({ role: 'tool', text: '↳ 子 agent 启动' })
+      this.pushEntry({ role: 'tool', text: t('notice.subagentStarted') })
     }
   }
 
@@ -1099,14 +1643,14 @@ class DshView extends ItemView {
         if (!this.plugin.settings.showToolActivity) return
         const name = data.name || 'tool'
         const args = typeof data.arguments === 'string' ? data.arguments : ''
-        this.pushEntry({ role: 'tool', text: `🔧 ${name} ${truncate(squeeze(args), 160)}` })
+        this.pushEntry({ role: 'tool', text: t('notice.toolCall', { name, args: truncate(squeeze(args), 160) }) })
         return
       }
       case 'tool/result': {
         if (!this.plugin.settings.showToolActivity) return
         if (data.error) {
           const detail = `${data.error.name || 'error'}: ${data.error.code || ''}`
-          this.pushEntry({ role: 'tool', text: `✗ ${truncate(detail, 160)}`, error: true })
+          this.pushEntry({ role: 'tool', text: t('notice.toolError', { detail: truncate(detail, 160) }), error: true })
         }
         return
       }
@@ -1116,7 +1660,7 @@ class DshView extends ItemView {
         return
       }
       case 'compaction/summary': {
-        this.pushEntry({ role: 'notice', text: '上下文已压缩' })
+        this.pushEntry({ role: 'notice', text: t('notice.compacted') })
         return
       }
       default:
@@ -1142,11 +1686,14 @@ class DshView extends ItemView {
     if (kind === 'error' && reason.error) {
       detail = reason.error.message || reason.error.code || ''
     } else if (kind === 'max-tokens') {
-      detail = '达到输出上限'
+      detail = t('notice.maxTokens')
     } else if (kind === 'aborted' && reason.reason) {
       detail = typeof reason.reason === 'object' ? reason.reason.kind || '' : String(reason.reason)
     }
-    this.pushEntry({ role: 'notice', text: `本轮结束：${kind}${detail ? `（${detail}）` : ''}` })
+    this.pushEntry({
+      role: 'notice',
+      text: t('notice.turnEnd', { kind, detail: detail ? t('notice.turnEndDetail', { detail }) : '' }),
+    })
   }
 
   /** 把 stderr 的推理/错误行转成提示（只挑有信息量的行，避免刷屏）。 */
@@ -1224,18 +1771,18 @@ class DshView extends ItemView {
         if (!isSessionExistsError(error)) throw error
         // 会话 id 撞了（例如进程被外部重启过）：换新 id 重试一次
         this.sessionId = mintSessionId()
-        this.pushEntry({ role: 'notice', text: '会话 id 冲突，已自动换用新会话重试。' })
+        this.pushEntry({ role: 'notice', text: t('notice.sessionConflict') })
         runtime = await this.ensureRuntime()
         await runtime.prompt(this.sessionId, text)
       }
       this.sessionUsed = true
-      this.setStatus('运行中…', 'running')
+      this.setStatus(t('panel.status.running'), 'running')
       await turn
-      this.setStatus('就绪', null)
+      this.setStatus(t('panel.status.ready'), null)
     } catch (error) {
       const message = error && error.message ? error.message : String(error)
-      this.setStatus('出错', 'error')
-      this.pushEntry({ role: 'notice', text: `出错：${truncate(message, 300)}` })
+      this.setStatus(t('panel.status.error'), 'error')
+      this.pushEntry({ role: 'notice', text: t('notice.error', { message: truncate(message, 300) }) })
       this.showErrorCard(error)
       void this.plugin.recordHandshake({ ok: false, at: Date.now(), error: message })
     } finally {
@@ -1251,25 +1798,28 @@ class DshView extends ItemView {
     this.sessionUsed = false
     this.lastAnswer = ''
     this.renderEmpty()
-    this.setStatus(this.runtime && this.runtime.alive ? '就绪（新会话）' : '未连接', null)
+    this.setStatus(
+      this.runtime && this.runtime.alive ? t('panel.status.readyNewSession') : t('panel.status.disconnected'),
+      null,
+    )
   }
 
   /** 把最后一条助手消息追加到当前笔记。 */
   async insertIntoNote() {
     if (!this.lastAnswer) {
-      new Notice('还没有可存入的回复')
+      new Notice(t('notice.nothingToSave'))
       return
     }
     const file = this.app.workspace.getActiveFile()
     if (!file) {
       await navigator.clipboard.writeText(this.lastAnswer)
-      new Notice('没有活动笔记，已复制到剪贴板')
+      new Notice(t('notice.noActiveNote'))
       return
     }
     const existing = await this.app.vault.read(file)
     const separator = existing.endsWith('\n') ? '\n' : '\n\n'
     await this.app.vault.modify(file, `${existing}${separator}${this.lastAnswer}\n`)
-    new Notice(`已存入 ${file.basename}`)
+    new Notice(t('notice.savedTo', { name: file.basename }))
   }
 }
 
@@ -1294,26 +1844,26 @@ async function checkEnvironment(plugin) {
   const nodePath = plugin.getNodePath()
   try {
     const version = (await execCapture(nodePath, ['--version'], 15000)).trim()
-    results.push({ name: 'Node.js', status: 'ok', detail: `${nodePath} -> ${version}` })
+    results.push({ name: t('env.node'), status: 'ok', detail: t('env.node.ok', { path: nodePath, version }) })
   } catch (error) {
     results.push({
-      name: 'Node.js',
+      name: t('env.node'),
       status: 'fail',
-      detail: `${nodePath} 无法执行：${error && error.message ? error.message : String(error)}`,
-      fix: '在设置里把「node 可执行文件」填成绝对路径，例如 C:\\Program Files\\nodejs\\node.exe',
+      detail: t('env.node.fail', { path: nodePath, message: error && error.message ? error.message : String(error) }),
+      fix: t('env.node.fix'),
     })
   }
 
   // 2) dsh CLI 产物
   const cliPath = plugin.getCliPath()
   if (cliPath && fs.existsSync(cliPath)) {
-    results.push({ name: 'dsh CLI 产物', status: 'ok', detail: cliPath })
+    results.push({ name: t('env.cli'), status: 'ok', detail: cliPath })
   } else {
     results.push({
-      name: 'dsh CLI 产物',
+      name: t('env.cli'),
       status: 'fail',
-      detail: cliPath ? `文件不存在：${cliPath}` : '未找到 bin.js',
-      fix: '在 deepseek-harness 仓库里执行 pnpm install 与 pnpm run build，然后在设置里指定 apps/cli/lib/bin.js',
+      detail: cliPath ? t('env.cli.notFoundFile', { path: cliPath }) : t('env.cli.missing'),
+      fix: t('env.cli.fix'),
     })
   }
 
@@ -1322,30 +1872,30 @@ async function checkEnvironment(plugin) {
   try {
     const stat = fs.statSync(cwd)
     results.push({
-      name: '工作区目录',
+      name: t('env.workspace'),
       status: stat.isDirectory() ? 'ok' : 'fail',
       detail: cwd,
-      fix: stat.isDirectory() ? undefined : '这个路径不是目录',
+      fix: stat.isDirectory() ? undefined : t('env.workspace.notDir'),
     })
   } catch {
     results.push({
-      name: '工作区目录',
+      name: t('env.workspace'),
       status: 'fail',
-      detail: `不存在：${cwd}`,
-      fix: '在设置里改成存在的目录，或留空使用 vault 根目录',
+      detail: t('env.workspace.missing', { path: cwd }),
+      fix: t('env.workspace.fix'),
     })
   }
 
   // 4) DSH_HOME
   const dshHome = settings.dshHome || path.join(os.homedir(), '.dsh')
   if (fs.existsSync(dshHome)) {
-    results.push({ name: 'DSH_HOME', status: 'ok', detail: dshHome })
+    results.push({ name: t('env.home'), status: 'ok', detail: dshHome })
   } else {
     results.push({
-      name: 'DSH_HOME',
+      name: t('env.home'),
       status: 'warn',
-      detail: `尚不存在：${dshHome}`,
-      fix: '首次启动 sdk profile 时 DSH 会自动创建，无需手动处理',
+      detail: t('env.home.missing', { path: dshHome }),
+      fix: t('env.home.fix'),
     })
   }
 
@@ -1353,12 +1903,12 @@ async function checkEnvironment(plugin) {
   const profileDir = path.join(dshHome, 'profiles', settings.profile || 'sdk')
   results.push(
     fs.existsSync(profileDir)
-      ? { name: `profile「${settings.profile}」`, status: 'ok', detail: profileDir }
+      ? { name: t('env.profile', { name: settings.profile }), status: 'ok', detail: profileDir }
       : {
-          name: `profile「${settings.profile}」`,
+          name: t('env.profile', { name: settings.profile }),
           status: 'warn',
-          detail: `尚未初始化：${profileDir}`,
-          fix: '首次启动会自动从随附模板初始化，可能耗时几十秒',
+          detail: t('env.profile.missing', { path: profileDir }),
+          fix: t('env.profile.fix'),
         },
   )
 
@@ -1366,15 +1916,15 @@ async function checkEnvironment(plugin) {
   const credFile = path.join(dshHome, '.credentials.yaml')
   const hasEnvKey = Boolean(process.env.DEEPSEEK_API_KEY)
   if (hasEnvKey) {
-    results.push({ name: '模型凭据', status: 'ok', detail: '检测到环境变量 DEEPSEEK_API_KEY（插件不读取其值）' })
+    results.push({ name: t('env.cred'), status: 'ok', detail: t('env.cred.env') })
   } else if (fs.existsSync(credFile)) {
-    results.push({ name: '模型凭据', status: 'ok', detail: `存在 ${credFile}（插件不读取其内容）` })
+    results.push({ name: t('env.cred'), status: 'ok', detail: t('env.cred.file', { path: credFile }) })
   } else {
     results.push({
-      name: '模型凭据',
+      name: t('env.cred'),
       status: 'warn',
-      detail: `未在环境变量或 ${credFile} 里发现凭据`,
-      fix: '按 DSH 的凭据方式配置 API key（插件本身不接触密钥）',
+      detail: t('env.cred.missing', { path: credFile }),
+      fix: t('env.cred.fix'),
     })
   }
 
@@ -1396,46 +1946,68 @@ class DshSettingTab extends PluginSettingTab {
     containerEl.empty()
 
     containerEl.createEl('h2', { text: 'DSH Native' })
-    containerEl.createEl('p', {
-      cls: 'setting-item-description',
-      text: '插件以 sdk profile 启动 dsh 子进程，并用换行分帧的 JSON-RPC 驱动它。留空的路径项会自动探测。',
-    })
+    containerEl.createEl('p', { cls: 'setting-item-description', text: t('set.topDesc') })
 
+    this.renderLanguageSection(containerEl)
     this.renderEnvironmentSection(containerEl)
     this.renderConnectionSection(containerEl)
     this.renderInteractionSection(containerEl)
     this.renderDiagnosticsSection(containerEl)
   }
 
+  /** 界面语言区。 */
+  renderLanguageSection(containerEl) {
+    containerEl.createEl('h3', { text: t('set.lang.heading') })
+
+    new Setting(containerEl)
+      .setName(t('set.lang.name'))
+      .setDesc(t('set.lang.desc'))
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption('auto', t('set.lang.auto'))
+          .addOption('zh', t('set.lang.zh'))
+          .addOption('en', t('set.lang.en'))
+          .setValue(this.plugin.settings.language)
+          .onChange(async (value) => {
+            this.plugin.settings.language = value
+            await this.plugin.saveSettings()
+            this.plugin.applyLanguage()
+            this.display()
+          }),
+      )
+  }
+
   /** 环境检测区。 */
   renderEnvironmentSection(containerEl) {
-    containerEl.createEl('h3', { text: '环境' })
+    containerEl.createEl('h3', { text: t('set.env.heading') })
 
     this.envResultEl = containerEl.createDiv({ cls: 'dsh-env-list' })
 
     new Setting(containerEl)
-      .setName('检测环境')
-      .setDesc('逐项检查 node、dsh 产物、工作区、DSH_HOME、profile 与凭据。只检测，不自动安装任何东西。')
+      .setName(t('set.env.checkName'))
+      .setDesc(t('set.env.checkDesc'))
       .addButton((button) =>
-        button.setButtonText('开始检测').onClick(async () => {
+        button.setButtonText(t('set.env.checkBtn')).onClick(async () => {
           button.setDisabled(true)
-          button.setButtonText('检测中…')
+          button.setButtonText(t('set.env.checking'))
           this.envResultEl.empty()
           try {
             const results = await checkEnvironment(this.plugin)
             this.renderEnvResults(results)
           } catch (error) {
-            this.envResultEl.createDiv({ text: `检测失败：${error && error.message ? error.message : String(error)}` })
+            this.envResultEl.createDiv({
+              text: t('env.checkFailed', { message: error && error.message ? error.message : String(error) }),
+            })
           } finally {
             button.setDisabled(false)
-            button.setButtonText('开始检测')
+            button.setButtonText(t('set.env.checkBtn'))
           }
         }),
       )
 
     new Setting(containerEl)
-      .setName('dsh CLI 产物（bin.js）')
-      .setDesc('指向仓库里构建好的启动器，例如 <你的仓库>\\apps\\cli\\lib\\bin.js')
+      .setName(t('set.env.cliName'))
+      .setDesc(t('set.env.cliDesc'))
       .addText((text) =>
         text
           .setPlaceholder(firstExisting(CLI_CANDIDATES, '') || 'C:\\path\\to\\deepseek-harness\\apps\\cli\\lib\\bin.js')
@@ -1446,22 +2018,22 @@ class DshSettingTab extends PluginSettingTab {
           }),
       )
       .addButton((button) =>
-        button.setButtonText('自动探测').onClick(async () => {
+        button.setButtonText(t('set.env.detectBtn')).onClick(async () => {
           const found = firstExisting(CLI_CANDIDATES, '')
           if (found) {
             this.plugin.settings.cliPath = found
             await this.plugin.saveSettings()
-            new Notice(`已找到：${found}`)
+            new Notice(t('set.env.detected', { path: found }))
           } else {
-            new Notice('未在常见位置找到 bin.js，请手动填写')
+            new Notice(t('set.env.notDetected'))
           }
           this.display()
         }),
       )
 
     new Setting(containerEl)
-      .setName('node 可执行文件')
-      .setDesc('留空则自动探测，仍找不到时回退为 PATH 上的 node。')
+      .setName(t('set.env.nodeName'))
+      .setDesc(t('set.env.nodeDesc'))
       .addText((text) =>
         text
           .setPlaceholder(firstExisting(NODE_CANDIDATES, 'node'))
@@ -1473,8 +2045,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('工作区目录（cwd）')
-      .setDesc('作为 initialize 的 cwd，也就是 agent 的工作区根目录。留空 = vault 根目录；写入被沙箱限制在此目录内。')
+      .setName(t('set.env.cwdName'))
+      .setDesc(t('set.env.cwdDesc'))
       .addText((text) =>
         text
           .setPlaceholder(this.plugin.getDefaultWorkspaceRoot())
@@ -1486,8 +2058,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('DSH_HOME')
-      .setDesc('留空 = 沿用 dsh 默认值（~/.dsh）。仅当你的配置目录不在默认位置时才需要填写。')
+      .setName(t('set.env.homeName'))
+      .setDesc(t('set.env.homeDesc'))
       .addText((text) =>
         text
           .setPlaceholder(path.join(os.homedir(), '.dsh'))
@@ -1498,7 +2070,7 @@ class DshSettingTab extends PluginSettingTab {
           }),
       )
 
-    new Setting(containerEl).setName('profile').addText((text) =>
+    new Setting(containerEl).setName(t('diag.profile')).addText((text) =>
       text
         .setPlaceholder('sdk')
         .setValue(this.plugin.settings.profile)
@@ -1520,23 +2092,23 @@ class DshSettingTab extends PluginSettingTab {
       const body = row.createDiv({ cls: 'dsh-env-body' })
       body.createDiv({ cls: 'dsh-env-name', text: item.name })
       body.createDiv({ cls: 'dsh-env-detail', text: item.detail })
-      if (item.fix) body.createDiv({ cls: 'dsh-env-fix', text: `建议：${item.fix}` })
+      if (item.fix) body.createDiv({ cls: 'dsh-env-fix', text: item.fix })
     }
     const bad = results.filter((r) => r.status === 'fail').length
     const warn = results.filter((r) => r.status === 'warn').length
     const summary = bad === 0
-      ? (warn === 0 ? '全部正常。' : `${warn} 项需要留意（多数首次启动会自动解决）。`)
-      : `${bad} 项失败，按上面的建议处理后重试。`
+      ? (warn === 0 ? t('env.summary.ok') : t('env.summary.warn', { count: warn }))
+      : t('env.summary.fail', { count: bad })
     el.createDiv({ cls: 'dsh-env-summary', text: summary })
   }
 
   /** 连接与模型路由区。 */
   renderConnectionSection(containerEl) {
-    containerEl.createEl('h3', { text: '连接与模型路由' })
+    containerEl.createEl('h3', { text: t('set.conn.heading') })
 
     new Setting(containerEl)
-      .setName('provider')
-      .setDesc('必须与 DSH 已注册的适配器一致；deepseek-official 内置可用。')
+      .setName(t('set.conn.providerName'))
+      .setDesc(t('set.conn.providerDesc'))
       .addText((text) =>
         text
           .setPlaceholder('deepseek-official')
@@ -1548,8 +2120,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('model')
-      .setDesc('握手时会由适配器校验该路由；不可用会直接报错，不会静默回退。')
+      .setName(t('set.conn.modelName'))
+      .setDesc(t('set.conn.modelDesc'))
       .addText((text) =>
         text
           .setPlaceholder('deepseek-v4-flash-vision-exp')
@@ -1561,8 +2133,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('reasoning effort')
-      .setDesc('可选，由适配器持有。留空则用模型默认值。')
+      .setName(t('set.conn.effortName'))
+      .setDesc(t('set.conn.effortDesc'))
       .addText((text) =>
         text
           .setPlaceholder('high')
@@ -1574,8 +2146,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('max tokens')
-      .setDesc('每次模型输出的上限；0 表示用模型默认值。')
+      .setName(t('set.conn.maxTokensName'))
+      .setDesc(t('set.conn.maxTokensDesc'))
       .addText((text) =>
         text
           .setPlaceholder('0')
@@ -1588,12 +2160,12 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('测试连接')
-      .setDesc('启动一次运行时并完成 initialize 握手，用来验证上面的配置。')
+      .setName(t('set.conn.testName'))
+      .setDesc(t('set.conn.testDesc'))
       .addButton((button) =>
-        button.setButtonText('测试').onClick(async () => {
+        button.setButtonText(t('set.conn.testBtn')).onClick(async () => {
           button.setDisabled(true)
-          button.setButtonText('测试中…')
+          button.setButtonText(t('set.conn.testing'))
           try {
             const runtime = new DshRuntime({
               nodePath: this.plugin.getNodePath(),
@@ -1619,16 +2191,16 @@ class DshSettingTab extends PluginSettingTab {
               profile: this.plugin.settings.profile,
               cwd: this.plugin.getWorkspaceRoot(),
             })
-            new Notice(`连接成功：${info.name} v${info.version}（${ms}ms）`)
+            new Notice(t('set.conn.testOk', { name: info.name, version: info.version, ms }))
             this.display()
           } catch (error) {
             const message = error && error.message ? error.message : String(error)
             await this.plugin.recordHandshake({ ok: false, at: Date.now(), error: message })
-            new Notice(`连接失败：${explainError(error).title}`)
+            new Notice(t('set.conn.testFail', { title: explainError(error).title }))
             this.display()
           } finally {
             button.setDisabled(false)
-            button.setButtonText('测试')
+            button.setButtonText(t('set.conn.testBtn'))
           }
         }),
       )
@@ -1636,16 +2208,16 @@ class DshSettingTab extends PluginSettingTab {
 
   /** 交互区。 */
   renderInteractionSection(containerEl) {
-    containerEl.createEl('h3', { text: '交互' })
+    containerEl.createEl('h3', { text: t('set.interact.heading') })
 
     new Setting(containerEl)
-      .setName('框选发送的内容')
-      .setDesc('命令「把选中内容发给 DSH」发什么。发送文件位置引用可让 agent 自己读文件，比贴原文更省 token，也能处理非整行选区。')
+      .setName(t('set.interact.selModeName'))
+      .setDesc(t('set.interact.selModeDesc'))
       .addDropdown((dropdown) =>
         dropdown
-          .addOption('reference', '只发文件位置引用（推荐）')
-          .addOption('text', '只发选中的原文')
-          .addOption('both', '引用 + 原文')
+          .addOption('reference', t('set.interact.selModeRef'))
+          .addOption('text', t('set.interact.selModeText'))
+          .addOption('both', t('set.interact.selModeBoth'))
           .setValue(this.plugin.settings.selectionMode)
           .onChange(async (value) => {
             this.plugin.settings.selectionMode = value
@@ -1654,12 +2226,12 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('框选后')
-      .setDesc('插入输入框可以让你先补一句要求再发送；直接发送更省事。')
+      .setName(t('set.interact.selActionName'))
+      .setDesc(t('set.interact.selActionDesc'))
       .addDropdown((dropdown) =>
         dropdown
-          .addOption('insert', '插入输入框，等我编辑')
-          .addOption('send', '直接发送')
+          .addOption('insert', t('set.interact.selActionInsert'))
+          .addOption('send', t('set.interact.selActionSend'))
           .setValue(this.plugin.settings.selectionAction)
           .onChange(async (value) => {
             this.plugin.settings.selectionAction = value
@@ -1668,8 +2240,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('显示工具调用')
-      .setDesc('在对话里显示 🔧 工具名等紧凑活动行。')
+      .setName(t('set.interact.toolsName'))
+      .setDesc(t('set.interact.toolsDesc'))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.showToolActivity).onChange(async (value) => {
           this.plugin.settings.showToolActivity = value
@@ -1678,8 +2250,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('笔记路径可点击')
-      .setDesc('把回复里出现的 vault 内路径渲染成链接，点击直接在 Obsidian 打开（支持 path.md:行号 定位）。')
+      .setName(t('set.interact.linkName'))
+      .setDesc(t('set.interact.linkDesc'))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.linkifyPaths).onChange(async (value) => {
           this.plugin.settings.linkifyPaths = value
@@ -1688,8 +2260,8 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
-      .setName('崩溃后自动重连')
-      .setDesc(`运行时意外退出时自动重试，最多 ${MAX_RECONNECT} 次（指数退避）。注意：重连后上下文会重置 —— 协议不支持跨进程续接会话。`)
+      .setName(t('set.interact.reconnectName'))
+      .setDesc(t('set.interact.reconnectDesc', { max: MAX_RECONNECT }))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoReconnect).onChange(async (value) => {
           this.plugin.settings.autoReconnect = value
@@ -1700,7 +2272,7 @@ class DshSettingTab extends PluginSettingTab {
 
   /** 诊断区。 */
   renderDiagnosticsSection(containerEl) {
-    containerEl.createEl('h3', { text: '诊断' })
+    containerEl.createEl('h3', { text: t('set.diag.heading') })
 
     const info = this.plugin.getDiagnostics()
     const list = containerEl.createDiv({ cls: 'dsh-diag' })
@@ -1711,24 +2283,24 @@ class DshSettingTab extends PluginSettingTab {
     }
 
     new Setting(containerEl)
-      .setName('复制诊断信息')
-      .setDesc('把上面的解析结果与最近一次握手记录复制到剪贴板，便于排查问题时贴出来。')
+      .setName(t('set.diag.copyName'))
+      .setDesc(t('set.diag.copyDesc'))
       .addButton((button) =>
-        button.setButtonText('复制').onClick(async () => {
+        button.setButtonText(t('set.diag.copyBtn')).onClick(async () => {
           const text = info.map(([label, value]) => `${label}: ${value}`).join('\n')
           await navigator.clipboard.writeText(text)
-          new Notice('已复制诊断信息')
+          new Notice(t('set.diag.copied'))
         }),
       )
 
     new Setting(containerEl)
-      .setName('清空面板记录')
-      .setDesc(`面板会保留最近 ${MAX_TRANSCRIPT} 条对话用于重载后查看（仅记录，不含上下文）。`)
+      .setName(t('set.diag.clearName'))
+      .setDesc(t('set.diag.clearDesc', { max: MAX_TRANSCRIPT }))
       .addButton((button) =>
-        button.setButtonText('清空').onClick(async () => {
+        button.setButtonText(t('set.diag.clearBtn')).onClick(async () => {
           this.plugin.settings.transcript = null
           await this.plugin.saveSettings()
-          new Notice('已清空面板记录')
+          new Notice(t('set.diag.cleared'))
         }),
       )
   }
@@ -1741,6 +2313,7 @@ class DshSettingTab extends PluginSettingTab {
 class DshPlugin extends Plugin {
   async onload() {
     await this.loadSettings()
+    setLanguage(this.settings.language)
     this.transcriptTimer = null
 
     this.registerView(VIEW_TYPE, (leaf) => new DshView(leaf, this))
@@ -1750,17 +2323,17 @@ class DshPlugin extends Plugin {
 
     this.addCommand({
       id: 'open-panel',
-      name: '打开对话面板',
+      name: t('panel.openPanelCommand'),
       callback: () => void this.activateView(),
     })
 
     this.addCommand({
       id: 'send-selection',
-      name: '把选中内容发给 DSH',
+      name: t('panel.sendSelectionCommand'),
       editorCallback: async (editor, ctx) => {
         const payload = buildSelectionPayload(editor, ctx.file, this.settings.selectionMode)
         if (!payload) {
-          new Notice('没有选中内容')
+          new Notice(t('notice.noSelection'))
           return
         }
         await this.activateView()
@@ -1779,6 +2352,13 @@ class DshPlugin extends Plugin {
       view.stopRuntime()
     }
     void this.flushTranscript()
+  }
+
+  /** 语言变化后刷新面板。 */
+  applyLanguage() {
+    setLanguage(this.settings.language)
+    const view = this.getView()
+    if (view) view.applyLanguage()
   }
 
   /** 取当前打开的 DSH 面板，没有则返回 null。 */
@@ -1835,28 +2415,35 @@ class DshPlugin extends Plugin {
   getDiagnostics() {
     const settings = this.settings
     const rows = [
-      ['插件版本', this.manifest.version],
-      ['node', this.getNodePath()],
-      ['dsh CLI 产物', this.getCliPath() || '（未找到）'],
-      ['DSH_HOME', settings.dshHome || path.join(os.homedir(), '.dsh')],
-      ['profile', settings.profile],
-      ['工作区目录', this.getWorkspaceRoot()],
-      ['provider / model', `${settings.provider} / ${settings.model}`],
-      ['reasoning effort', settings.reasoningEffort || '（模型默认）'],
-      ['max tokens', String(settings.maxTokens || 0)],
+      [t('diag.version'), this.manifest.version],
+      [t('diag.node'), this.getNodePath()],
+      [t('diag.cli'), this.getCliPath() || t('diag.notFound')],
+      [t('diag.home'), settings.dshHome || path.join(os.homedir(), '.dsh')],
+      [t('diag.profile'), settings.profile],
+      [t('diag.cwd'), this.getWorkspaceRoot()],
+      [t('diag.route'), `${settings.provider} / ${settings.model}`],
+      [t('diag.effort'), settings.reasoningEffort || t('diag.modelDefault')],
+      [t('diag.maxTokens'), String(settings.maxTokens || 0)],
     ]
     const last = settings.lastHandshake
     if (!last) {
-      rows.push(['最近一次握手', '（本机还没有记录）'])
+      rows.push([t('diag.lastHandshake'), t('diag.noHandshake')])
     } else {
       const when = new Date(last.at).toLocaleString()
       const detail = last.ok
-        ? `成功 · ${when}${last.handshakeMs ? ` · 耗时 ${last.handshakeMs}ms` : ''}${last.serverInfo ? ` · ${last.serverInfo.name} v${last.serverInfo.version}` : ''}`
-        : `失败 · ${when} · ${truncate(last.error || '', 160)}`
-      rows.push(['最近一次握手', detail])
+        ? t('diag.handshakeOk', {
+            when,
+            ms: last.handshakeMs ? t('diag.handshakeMs', { ms: last.handshakeMs }) : '',
+            server: last.serverInfo ? t('diag.handshakeServer', { name: last.serverInfo.name, version: last.serverInfo.version }) : '',
+          })
+        : t('diag.handshakeFail', { when, error: truncate(last.error || '', 160) })
+      rows.push([t('diag.lastHandshake'), detail])
     }
     const view = this.getView()
-    rows.push(['面板运行时', view && view.runtime && view.runtime.alive ? '运行中' : '未运行'])
+    rows.push([
+      t('diag.runtime'),
+      view && view.runtime && view.runtime.alive ? t('diag.running') : t('diag.notRunning'),
+    ])
     return rows
   }
 
@@ -1865,9 +2452,9 @@ class DshPlugin extends Plugin {
     const results = await checkEnvironment(this)
     const bad = results.filter((r) => r.status === 'fail')
     if (bad.length === 0) {
-      new Notice('环境检测：没有发现致命问题（详情见插件设置页）')
+      new Notice(t('env.report.ok'))
     } else {
-      new Notice(`环境检测：${bad.length} 项失败 —— ${bad.map((b) => b.name).join('、')}（详情见插件设置页）`)
+      new Notice(t('env.report.fail', { count: bad.length, names: bad.map((b) => b.name).join(', ') }))
     }
     return results
   }
@@ -1910,5 +2497,10 @@ module.exports.DshRuntime = DshRuntime
 module.exports.DshView = DshView
 module.exports.explainError = explainError
 module.exports.buildSelectionPayload = buildSelectionPayload
+module.exports.buildSelectionReference = buildSelectionReference
 module.exports.checkEnvironment = checkEnvironment
 module.exports.linkifyVaultPaths = linkifyVaultPaths
+module.exports.setLanguage = setLanguage
+module.exports.getLanguage = getLanguage
+module.exports.DICT = DICT
+module.exports.ERR = ERR
