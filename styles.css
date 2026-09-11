@@ -276,6 +276,38 @@
   margin-bottom: 12px;
 }
 
+/* ---------- 设置页：当前生效的模型路由 ---------- */
+.dsh-route {
+  background: var(--background-secondary);
+  border-radius: var(--radius-s);
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+
+.dsh-route-row {
+  display: flex;
+  gap: 8px;
+  font-size: var(--font-ui-smaller);
+  line-height: 1.7;
+}
+
+.dsh-route-label {
+  flex: 0 0 8em;
+  color: var(--text-muted);
+}
+
+.dsh-route-value {
+  flex: 1 1 auto;
+  font-family: var(--font-monospace);
+  word-break: break-all;
+}
+
+.dsh-route-warn {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-error);
+  margin-top: 4px;
+}
+
 .dsh-diag-row {
   display: flex;
   gap: 8px;

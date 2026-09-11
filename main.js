@@ -88,13 +88,22 @@ const ERR = {
 
 /**
  * 常见 CLI 产物位置，用于「自动探测」。
- * 一律相对于家目录拼，避免把某台机器的绝对路径硬编码进来。
+ * 一律相对于家目录或标准安装位置拼，避免把某台机器的绝对路径硬编码进来。
+ *
+ * 两种安装形态的入口相对路径是一样的（`lib/bin.js`）：
+ *   - git 检出：<仓库>/apps/cli/lib/bin.js
+ *   - npm 安装：<npm 全局目录>/@deepseek-ai/dsh/lib/bin.js
  */
 const CLI_CANDIDATES = [
   path.join(os.homedir(), 'deepseek-harness', 'apps', 'cli', 'lib', 'bin.js'),
   path.join(os.homedir(), 'code', 'deepseek-harness', 'apps', 'cli', 'lib', 'bin.js'),
   path.join(os.homedir(), 'projects', 'deepseek-harness', 'apps', 'cli', 'lib', 'bin.js'),
   path.join(os.homedir(), '.dsh', 'bin', 'bin.js'),
+  // npm 全局安装
+  path.join(os.homedir(), 'AppData', 'Roaming', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+  '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
+  '/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
+  '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
 ]
 
 /** 常见 node 可执行文件位置，用于「自动探测」。 */
@@ -115,10 +124,13 @@ const DEFAULT_SETTINGS = {
   dshHome: '',
   profile: 'sdk',
   cwd: '',
-  provider: 'deepseek-official',
-  model: 'deepseek-v4-flash-vision-exp',
-  reasoningEffort: 'high',
+  // 留空 = 跟随 DSH 自己的默认模型设置（$DSH_HOME/settings.yaml 的 agent-default-model）
+  provider: '',
+  model: '',
+  reasoningEffort: '',
   maxTokens: 0,
+  // 最近一次探测到的 DSH 信息：{ version, at }
+  dshInfo: null,
   showToolActivity: true,
   // 选中内容的发送方式：reference=只发文件位置引用；text=只发原文；both=两者
   selectionMode: 'reference',
@@ -183,7 +195,7 @@ const DICT = {
     'err.noCli.hint2': '然后在设置里把「dsh CLI 产物」指向 apps/cli/lib/bin.js。',
     'err.provider.title': 'provider 名称不被识别',
     'err.provider.hint1': 'provider 必须与 DSH 已注册的适配器一致；deepseek-official 内置可用。',
-    'err.provider.hint2': '检查设置里的 provider / model 拼写。',
+    'err.provider.hint2': '检查设置里的 provider / model 拼写。这两项留空时，插件会用 DSH 自己设置的默认模型。',
     'err.initTimeout.title': 'initialize 握手超时',
     'err.initTimeout.hint1': '首次使用 sdk profile 时 DSH 要从随附模板自举，可能需要几十秒到几分钟。',
     'err.initTimeout.hint2': '也可能是同时在启动多个实例；稍等后重试或重启运行时。',
@@ -233,6 +245,15 @@ const DICT = {
     'env.cred.file': '存在 {path}（插件不读取其内容）',
     'env.cred.missing': '未在环境变量或 {path} 里发现凭据',
     'env.cred.fix': '按 DSH 的凭据方式配置 API key（插件本身不接触密钥）',
+    'env.dshVersion': 'dsh 版本',
+    'env.dshVersion.ok': '{version}',
+    'env.dshVersion.fail': '无法执行 --version：{message}',
+    'env.dshVersion.fix': '确认 node 可执行文件与 dsh CLI 产物路径都正确',
+    'env.build': '构建产物是否落后于源码',
+    'env.build.ok': '不落后（产物时间 {built}）',
+    'env.build.stale': '落后：源码最新改动 {source}，产物是 {built}',
+    'env.build.fix': '在 dsh 仓库里执行 pnpm run build。插件跑的是 apps/cli/lib/bin.js 这个构建产物，只 git pull 不会生效',
+    'env.build.notApplicable': '不是 git 检出的目录结构，无法判断（用 npm 安装的包不需要重新构建）',
     'env.summary.ok': '全部正常。',
     'env.summary.warn': '{count} 项需要留意（多数首次启动会自动解决）。',
     'env.summary.fail': '{count} 项失败，按上面的建议处理后重试。',
@@ -259,12 +280,23 @@ const DICT = {
     'set.env.homeName': 'DSH_HOME',
     'set.env.homeDesc': '留空 = 沿用 dsh 默认值（~/.dsh）。仅当你的配置目录不在默认位置时才需要填写。',
     'set.conn.heading': '连接与模型路由',
-    'set.conn.providerName': 'provider',
-    'set.conn.providerDesc': '必须与 DSH 已注册的适配器一致；deepseek-official 内置可用。',
-    'set.conn.modelName': 'model',
-    'set.conn.modelDesc': '握手时会由适配器校验该路由；不可用会直接报错，不会静默回退。',
-    'set.conn.effortName': 'reasoning effort',
-    'set.conn.effortDesc': '可选，由适配器持有。留空则用模型默认值。',
+    'set.conn.effective': '当前生效',
+    'set.conn.routeSource': '来源',
+    'set.conn.partialOverride': 'provider 与 model 只填了一个。两者需要成对填写，所以这次仍按下面的来源取值。',
+    'set.conn.usingFallback': '没能从 DSH 的设置里读到默认模型，正在用插件内置的兜底值；DSH 更新后它可能失效。',
+    'set.conn.providerName': 'provider（留空则跟随 DSH）',
+    'set.conn.providerDesc': '留空时使用 DSH 自己设置的默认模型，也就是设置文档里的 agent-default-model。',
+    'set.conn.modelName': 'model（留空则跟随 DSH）',
+    'set.conn.modelDesc': '留空时同样跟随 DSH。握手时由适配器校验这个组合，不可用会直接报错，不会静默回退。',
+    'set.conn.effortName': 'reasoning effort（留空则跟随 DSH）',
+    'set.conn.effortDesc': '可选，由适配器持有。留空时用 DSH 设置里的值；DSH 也没设则用模型默认值。',
+    'set.conn.reloadName': '重新读取 DSH 设置',
+    'set.conn.reloadDesc': '在 DSH 界面里改过默认模型之后，点这里刷新上面的取值。面板每次启动运行时也会重新读一遍。',
+    'set.conn.reloadBtn': '重新读取',
+    'set.conn.reloaded': '已重新读取',
+    'route.sourcePlugin': '插件设置',
+    'route.sourceDsh': '跟随 DSH 设置',
+    'route.sourceFallback': '插件内置兜底值',
     'set.conn.maxTokensName': 'max tokens',
     'set.conn.maxTokensDesc': '每次模型输出的上限；0 表示用模型默认值。',
     'set.conn.testName': '测试连接',
@@ -314,6 +346,13 @@ const DICT = {
     'diag.cwd': '工作区目录',
     'diag.route': 'provider / model',
     'diag.effort': 'reasoning effort',
+    'diag.dshVersion': 'DSH 版本',
+    'diag.dshNotProbed': '（尚未探测）',
+    'diag.routeSource': '模型来源',
+    'diag.cliFreshness': '构建产物',
+    'diag.buildFresh': '不落后于源码',
+    'diag.buildStale': '落后于源码，需要重新构建',
+    'diag.buildUnknown': '（无法判断）',
     'diag.maxTokens': 'max tokens',
     'diag.lastHandshake': '最近一次握手',
     'diag.noHandshake': '（本机还没有记录）',
@@ -395,7 +434,7 @@ const DICT = {
     'err.noCli.hint2': 'Then point "dsh CLI artifact" in the settings at apps/cli/lib/bin.js.',
     'err.provider.title': 'Provider name not recognized',
     'err.provider.hint1': 'The provider must match an adapter registered in DSH; deepseek-official is built in.',
-    'err.provider.hint2': 'Check the provider / model spelling in the settings.',
+    'err.provider.hint2': 'Check the provider / model spelling in the settings. When both are empty, the plugin uses the default model configured in DSH.',
     'err.initTimeout.title': 'initialize handshake timed out',
     'err.initTimeout.hint1': 'The first use of the sdk profile bootstraps it from a bundled template, which can take tens of seconds to a few minutes.',
     'err.initTimeout.hint2': 'It can also be several instances starting at once; wait a moment, then retry or restart the runtime.',
@@ -445,6 +484,15 @@ const DICT = {
     'env.cred.file': 'Found {path} (the plugin does not read its contents)',
     'env.cred.missing': 'No credentials found in the environment or at {path}',
     'env.cred.fix': 'Configure an API key the way DSH expects (the plugin itself never touches keys)',
+    'env.dshVersion': 'dsh version',
+    'env.dshVersion.ok': '{version}',
+    'env.dshVersion.fail': 'Could not run --version: {message}',
+    'env.dshVersion.fix': 'Check that the node executable and the dsh CLI artifact paths are correct',
+    'env.build': 'Build artifact older than the sources',
+    'env.build.ok': 'Up to date (artifact from {built})',
+    'env.build.stale': 'Out of date: newest source change {source}, artifact from {built}',
+    'env.build.fix': 'Run pnpm run build in the dsh repository. The plugin runs apps/cli/lib/bin.js, a build artifact, so a git pull alone has no effect',
+    'env.build.notApplicable': 'Not a git checkout layout, cannot tell (an npm-installed package needs no rebuild)',
     'env.summary.ok': 'Everything looks good.',
     'env.summary.warn': '{count} item(s) need attention (most resolve themselves on first start).',
     'env.summary.fail': '{count} item(s) failed — apply the suggestions above and try again.',
@@ -471,12 +519,23 @@ const DICT = {
     'set.env.homeName': 'DSH_HOME',
     'set.env.homeDesc': 'Empty = the dsh default (~/.dsh). Only needed when your config directory is somewhere else.',
     'set.conn.heading': 'Connection and model routing',
-    'set.conn.providerName': 'provider',
-    'set.conn.providerDesc': 'Must match an adapter registered in DSH; deepseek-official is built in.',
-    'set.conn.modelName': 'model',
-    'set.conn.modelDesc': 'The route is validated by the adapter during the handshake; an unavailable route errors out instead of silently falling back.',
-    'set.conn.effortName': 'reasoning effort',
-    'set.conn.effortDesc': 'Optional and adapter-owned. Empty uses the model default.',
+    'set.conn.effective': 'Currently in effect',
+    'set.conn.routeSource': 'Source',
+    'set.conn.partialOverride': 'Only one of provider and model is filled in. They must be set together, so the source below is used instead.',
+    'set.conn.usingFallback': 'Could not read a default model from the DSH settings, so the built-in fallback value is in use. It may stop working after a DSH update.',
+    'set.conn.providerName': 'provider (empty follows DSH)',
+    'set.conn.providerDesc': 'When empty, the default model configured in DSH is used — the agent-default-model section of the settings document.',
+    'set.conn.modelName': 'model (empty follows DSH)',
+    'set.conn.modelDesc': 'When empty, this also follows DSH. The adapter validates the pair during the handshake; an unavailable route errors out instead of silently falling back.',
+    'set.conn.effortName': 'reasoning effort (empty follows DSH)',
+    'set.conn.effortDesc': 'Optional and adapter-owned. When empty, the value from the DSH settings is used; if DSH has none either, the model default applies.',
+    'set.conn.reloadName': 'Re-read the DSH settings',
+    'set.conn.reloadDesc': 'After changing the default model in the DSH interface, click here to refresh the values above. Starting the runtime also re-reads them.',
+    'set.conn.reloadBtn': 'Re-read',
+    'set.conn.reloaded': 'Re-read',
+    'route.sourcePlugin': 'Plugin settings',
+    'route.sourceDsh': 'Following DSH settings',
+    'route.sourceFallback': 'Plugin fallback value',
     'set.conn.maxTokensName': 'max tokens',
     'set.conn.maxTokensDesc': 'Output cap per model request; 0 uses the model default.',
     'set.conn.testName': 'Test connection',
@@ -526,6 +585,13 @@ const DICT = {
     'diag.cwd': 'Workspace directory',
     'diag.route': 'provider / model',
     'diag.effort': 'reasoning effort',
+    'diag.dshVersion': 'DSH version',
+    'diag.dshNotProbed': '(not probed yet)',
+    'diag.routeSource': 'Model source',
+    'diag.cliFreshness': 'Build artifact',
+    'diag.buildFresh': 'Up to date with the sources',
+    'diag.buildStale': 'Older than the sources — rebuild needed',
+    'diag.buildUnknown': '(cannot tell)',
     'diag.maxTokens': 'max tokens',
     'diag.lastHandshake': 'Last handshake',
     'diag.noHandshake': '(no record on this machine yet)',
@@ -697,6 +763,255 @@ function execCapture(file, args, timeoutMs) {
       else resolve(String(stdout || ''))
     })
   })
+}
+
+/* ------------------------------------------------------------------ *
+ * 跟随 DSH 的模型设置
+ * ------------------------------------------------------------------ */
+
+/**
+ * DSH 存放默认模型的设置分节名。
+ *
+ * 来自 @deepseek-ai/dsh-agent-default-model 的
+ * `AGENT_DEFAULT_MODEL_SETTINGS_NAMESPACE`。
+ */
+const DSH_DEFAULT_MODEL_SECTION = 'agent-default-model'
+
+/**
+ * 设置文档不存在或没写这一节时的兜底路由。
+ *
+ * 只在 DSH 那边完全读不到设置时才会用到，因此可能随 DSH 版本失效；
+ * 诊断里会标明当前用的是兜底值。
+ */
+const FALLBACK_ROUTE = { provider: 'deepseek-official', model: 'deepseek-v4-flash-vision-exp' }
+
+/**
+ * 去掉行尾注释（不处理引号内的 `#` 之外的花哨情况）。
+ * @param {string} line
+ */
+function stripYamlComment(line) {
+  let quote = ''
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]
+    if (quote) {
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char === '#' && (index === 0 || /\s/.test(line[index - 1]))) return line.slice(0, index)
+  }
+  return line
+}
+
+/** 去掉值两侧成对的引号。 */
+function unquoteYamlValue(value) {
+  const text = String(value || '').trim()
+  if (text.length >= 2) {
+    const first = text[0]
+    const last = text[text.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) return text.slice(1, -1)
+  }
+  return text
+}
+
+/**
+ * 解析设置文档里各顶层分节的标量字段。
+ *
+ * 这是一个**针对性**的读取器，不是通用 YAML 解析器：只认「顶层分节 + 一层
+ * 标量字段」这种形状（DSH 写设置文档就是这个形状），嵌套更深的层级会跳过。
+ * 之所以不引入依赖，是因为插件要保持零运行时依赖。
+ *
+ * @param {string} text
+ * @returns {Record<string, Record<string, string>>}
+ */
+function parseYamlSections(text) {
+  const sections = {}
+  let current = null
+
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    if (!rawLine.trim() || rawLine.trim().startsWith('#')) continue
+    const line = stripYamlComment(rawLine)
+    if (!line.trim()) continue
+
+    const indented = /^\s/.test(line)
+    if (!indented) {
+      const top = /^([A-Za-z0-9_.-]+):\s*(.*)$/.exec(line)
+      if (!top) {
+        current = null
+        continue
+      }
+      current = top[1]
+      sections[current] = {}
+      const inline = top[2].trim()
+      // 支持 `section: {a: 1, b: 2}` 这种流式写法
+      if (inline.startsWith('{') && inline.endsWith('}')) {
+        for (const pair of inline.slice(1, -1).split(',')) {
+          const separator = pair.indexOf(':')
+          if (separator < 0) continue
+          sections[current][pair.slice(0, separator).trim()] = unquoteYamlValue(pair.slice(separator + 1))
+        }
+      }
+      continue
+    }
+
+    if (current === null) continue
+    const child = /^\s+([A-Za-z0-9_.-]+):\s*(.*)$/.exec(line)
+    if (child) sections[current][child[1]] = unquoteYamlValue(child[2])
+  }
+
+  return sections
+}
+
+/**
+ * 读 DSH 的设置文档（`settings.yaml`，或同目录的 `settings.json`）。
+ * @param {string} dshHome
+ * @returns {Record<string, Record<string, string>> | null}
+ */
+function readDshSettingsDocument(dshHome) {
+  if (!dshHome) return null
+  const yamlPath = path.join(dshHome, 'settings.yaml')
+  try {
+    return parseYamlSections(fs.readFileSync(yamlPath, 'utf8'))
+  } catch {
+    /* 换 json */
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(dshHome, 'settings.json'), 'utf8'))
+    if (parsed && typeof parsed === 'object') return parsed
+  } catch {
+    /* 读不到就交给调用方回退 */
+  }
+  return null
+}
+
+/**
+ * 读 DSH 当前的默认模型设置。
+ *
+ * DSH 把用户在界面里选的默认模型存在这个分节里（`provider` / `model` 必填，
+ * `reasoningEffort` 可选），所以跟着它走，DSH 换了模型插件也会跟着换。
+ *
+ * @param {string} dshHome
+ * @returns {{ provider: string, model: string, reasoningEffort: string } | null}
+ */
+function readDshDefaultModel(dshHome) {
+  const document = readDshSettingsDocument(dshHome)
+  const section = document && document[DSH_DEFAULT_MODEL_SECTION]
+  if (!section || typeof section !== 'object') return null
+  const provider = typeof section.provider === 'string' ? section.provider.trim() : ''
+  const model = typeof section.model === 'string' ? section.model.trim() : ''
+  if (!provider || !model) return null
+  const reasoningEffort = typeof section.reasoningEffort === 'string' ? section.reasoningEffort.trim() : ''
+  return { provider, model, reasoningEffort }
+}
+
+/**
+ * 算出这次要用的模型路由。
+ *
+ * 优先级：
+ *   1. 插件设置里 provider 与 model **都**填了 —— 用插件的（source = 'plugin'）
+ *   2. DSH 设置文档里有 —— 用 DSH 的（source = 'dsh'）
+ *   3. 都没有 —— 用内置兜底（source = 'fallback'）
+ *
+ * provider 与 model 必须成对，所以不把两者拆开来各自回退，避免拼出无效组合。
+ * reasoningEffort 是可选的，可以单独覆盖。
+ *
+ * @param {{ provider?: string, model?: string, reasoningEffort?: string }} settings
+ * @param {string} dshHome
+ * @returns {{ provider: string, model: string, reasoningEffort: string, source: 'plugin'|'dsh'|'fallback', dshDefault: object|null, partialOverride: boolean }}
+ */
+function resolveRoute(settings, dshHome) {
+  const provider = String(settings.provider || '').trim()
+  const model = String(settings.model || '').trim()
+  const effort = String(settings.reasoningEffort || '').trim()
+  const dshDefault = readDshDefaultModel(dshHome)
+
+  const hasFullOverride = Boolean(provider && model)
+  const partialOverride = Boolean(provider !== model && (!provider || !model))
+
+  let base
+  let source
+  if (hasFullOverride) {
+    base = { provider, model }
+    source = 'plugin'
+  } else if (dshDefault) {
+    base = { provider: dshDefault.provider, model: dshDefault.model }
+    source = 'dsh'
+  } else {
+    base = { provider: FALLBACK_ROUTE.provider, model: FALLBACK_ROUTE.model }
+    source = 'fallback'
+  }
+
+  return {
+    provider: base.provider,
+    model: base.model,
+    reasoningEffort: effort || (dshDefault ? dshDefault.reasoningEffort : ''),
+    source,
+    dshDefault,
+    partialOverride,
+  }
+}
+
+/**
+ * 查 CLI 自己的版本号（`node <bin.js> --version`）。
+ * @param {string} nodePath
+ * @param {string} cliPath
+ * @returns {Promise<string>}
+ */
+async function probeDshVersion(nodePath, cliPath) {
+  const output = await execCapture(nodePath, [cliPath, '--version'], 30000)
+  return output.trim()
+}
+
+/** 路由来源的可读名称。 */
+function routeSourceLabel(source) {
+  if (source === 'plugin') return t('route.sourcePlugin')
+  if (source === 'dsh') return t('route.sourceDsh')
+  return t('route.sourceFallback')
+}
+
+/**
+ * 检查插件的构建产物是否落后于源码。
+ *
+ * 插件跑的是 `apps/cli/lib/bin.js` 这个**构建产物**：源码更新了却没重新构建时，
+ * DSH 看起来「更新了」，实际跑的仍是旧代码。只在看起来像 git 检出时才有意义。
+ *
+ * @param {string} cliPath
+ * @returns {{ applicable: boolean, stale: boolean, newestSource?: string, builtAt?: Date, sourceAt?: Date }}
+ */
+function checkBuildFreshness(cliPath) {
+  if (!cliPath) return { applicable: false, stale: false }
+  const libDir = path.dirname(cliPath)
+  // 检出的布局是 <repo>/apps/cli/lib/bin.js，源码在 <repo>/apps/cli/src
+  const srcDir = path.join(path.dirname(libDir), 'src')
+  try {
+    const built = fs.statSync(cliPath)
+    if (!fs.existsSync(srcDir)) return { applicable: false, stale: false }
+    let newest = null
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) walk(full)
+        else {
+          const stat = fs.statSync(full)
+          if (!newest || stat.mtimeMs > newest.mtimeMs) newest = { mtimeMs: stat.mtimeMs, file: full }
+        }
+      }
+    }
+    walk(srcDir)
+    if (!newest) return { applicable: false, stale: false }
+    return {
+      applicable: true,
+      stale: newest.mtimeMs > built.mtimeMs + 1000,
+      newestSource: newest.file,
+      builtAt: built.mtime,
+      sourceAt: new Date(newest.mtimeMs),
+    }
+  } catch {
+    return { applicable: false, stale: false }
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1480,14 +1795,16 @@ class DshView extends ItemView {
       this.pushEntry({ role: 'notice', text: t('panel.runtimeRestarted') })
     }
 
+    // 模型路由每次启动都重新解析：DSH 那边改了默认模型，这里点「重启」就会跟上
+    const route = this.plugin.getRoute()
     const runtime = new DshRuntime({
       nodePath,
       cliPath,
       profile: settings.profile,
       cwd: this.plugin.getWorkspaceRoot(),
-      provider: settings.provider,
-      model: settings.model,
-      reasoningEffort: settings.reasoningEffort,
+      provider: route.provider,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort,
       maxTokens: settings.maxTokens,
       dshHome: settings.dshHome,
       onNotification: (method, params) => this.onNotification(method, params),
@@ -1506,8 +1823,9 @@ class DshView extends ItemView {
       at: Date.now(),
       serverInfo: info,
       handshakeMs: runtime.handshakeMs,
-      provider: settings.provider,
-      model: settings.model,
+      provider: route.provider,
+      model: route.model,
+      routeSource: route.source,
       profile: settings.profile,
       cwd: this.plugin.getWorkspaceRoot(),
     })
@@ -1928,6 +2246,47 @@ async function checkEnvironment(plugin) {
     })
   }
 
+  // 7) dsh 版本（顺带把结果缓存进设置，供诊断区显示）
+  if (cliPath && fs.existsSync(cliPath)) {
+    try {
+      const version = await probeDshVersion(plugin.getNodePath(), cliPath)
+      results.push({ name: t('env.dshVersion'), status: 'ok', detail: t('env.dshVersion.ok', { version }) })
+      if (typeof plugin.saveSettings === 'function') {
+        plugin.settings.dshInfo = { version, at: Date.now() }
+        await plugin.saveSettings()
+      }
+    } catch (error) {
+      results.push({
+        name: t('env.dshVersion'),
+        status: 'warn',
+        detail: t('env.dshVersion.fail', { message: error && error.message ? error.message : String(error) }),
+        fix: t('env.dshVersion.fix'),
+      })
+    }
+  }
+
+  // 8) 构建产物是否落后于源码。插件跑的是构建产物，只 pull 不 build 会静默跑旧代码
+  const freshness = checkBuildFreshness(cliPath)
+  if (!freshness.applicable) {
+    results.push({ name: t('env.build'), status: 'ok', detail: t('env.build.notApplicable') })
+  } else if (freshness.stale) {
+    results.push({
+      name: t('env.build'),
+      status: 'fail',
+      detail: t('env.build.stale', {
+        source: freshness.sourceAt.toLocaleString(),
+        built: freshness.builtAt.toLocaleString(),
+      }),
+      fix: t('env.build.fix'),
+    })
+  } else {
+    results.push({
+      name: t('env.build'),
+      status: 'ok',
+      detail: t('env.build.ok', { built: freshness.builtAt.toLocaleString() }),
+    })
+  }
+
   return results
 }
 
@@ -2106,12 +2465,32 @@ class DshSettingTab extends PluginSettingTab {
   renderConnectionSection(containerEl) {
     containerEl.createEl('h3', { text: t('set.conn.heading') })
 
+    // 当前生效的路由：每次重绘都会重新读一遍 DSH 的设置文档
+    const route = this.plugin.getRoute()
+
+    const routeEl = containerEl.createDiv({ cls: 'dsh-route' })
+    const valueRow = routeEl.createDiv({ cls: 'dsh-route-row' })
+    valueRow.createSpan({ cls: 'dsh-route-label', text: t('set.conn.effective') })
+    valueRow.createSpan({ cls: 'dsh-route-value', text: `${route.provider} / ${route.model}` })
+
+    const sourceRow = routeEl.createDiv({ cls: 'dsh-route-row' })
+    sourceRow.createSpan({ cls: 'dsh-route-label', text: t('set.conn.routeSource') })
+    const sourceText = route.reasoningEffort
+      ? `${routeSourceLabel(route.source)} · ${t('diag.effort')} = ${route.reasoningEffort}`
+      : routeSourceLabel(route.source)
+    sourceRow.createSpan({ cls: 'dsh-route-value', text: sourceText })
+
+    if (route.partialOverride) routeEl.createDiv({ cls: 'dsh-route-warn', text: t('set.conn.partialOverride') })
+    if (route.source === 'fallback') routeEl.createDiv({ cls: 'dsh-route-warn', text: t('set.conn.usingFallback') })
+
+    const dshDefault = route.dshDefault
+
     new Setting(containerEl)
       .setName(t('set.conn.providerName'))
       .setDesc(t('set.conn.providerDesc'))
       .addText((text) =>
         text
-          .setPlaceholder('deepseek-official')
+          .setPlaceholder(dshDefault ? dshDefault.provider : FALLBACK_ROUTE.provider)
           .setValue(this.plugin.settings.provider)
           .onChange(async (value) => {
             this.plugin.settings.provider = value.trim()
@@ -2124,7 +2503,7 @@ class DshSettingTab extends PluginSettingTab {
       .setDesc(t('set.conn.modelDesc'))
       .addText((text) =>
         text
-          .setPlaceholder('deepseek-v4-flash-vision-exp')
+          .setPlaceholder(dshDefault ? dshDefault.model : FALLBACK_ROUTE.model)
           .setValue(this.plugin.settings.model)
           .onChange(async (value) => {
             this.plugin.settings.model = value.trim()
@@ -2137,7 +2516,7 @@ class DshSettingTab extends PluginSettingTab {
       .setDesc(t('set.conn.effortDesc'))
       .addText((text) =>
         text
-          .setPlaceholder('high')
+          .setPlaceholder(dshDefault && dshDefault.reasoningEffort ? dshDefault.reasoningEffort : t('diag.modelDefault'))
           .setValue(this.plugin.settings.reasoningEffort)
           .onChange(async (value) => {
             this.plugin.settings.reasoningEffort = value.trim()
@@ -2160,6 +2539,16 @@ class DshSettingTab extends PluginSettingTab {
       )
 
     new Setting(containerEl)
+      .setName(t('set.conn.reloadName'))
+      .setDesc(t('set.conn.reloadDesc'))
+      .addButton((button) =>
+        button.setButtonText(t('set.conn.reloadBtn')).onClick(() => {
+          new Notice(t('set.conn.reloaded'))
+          this.display()
+        }),
+      )
+
+    new Setting(containerEl)
       .setName(t('set.conn.testName'))
       .setDesc(t('set.conn.testDesc'))
       .addButton((button) =>
@@ -2167,14 +2556,15 @@ class DshSettingTab extends PluginSettingTab {
           button.setDisabled(true)
           button.setButtonText(t('set.conn.testing'))
           try {
+            const route = this.plugin.getRoute()
             const runtime = new DshRuntime({
               nodePath: this.plugin.getNodePath(),
               cliPath: this.plugin.getCliPath(),
               profile: this.plugin.settings.profile,
               cwd: this.plugin.getWorkspaceRoot(),
-              provider: this.plugin.settings.provider,
-              model: this.plugin.settings.model,
-              reasoningEffort: this.plugin.settings.reasoningEffort,
+              provider: route.provider,
+              model: route.model,
+              reasoningEffort: route.reasoningEffort,
               maxTokens: this.plugin.settings.maxTokens,
               dshHome: this.plugin.settings.dshHome,
             })
@@ -2186,8 +2576,9 @@ class DshSettingTab extends PluginSettingTab {
               at: Date.now(),
               serverInfo: info,
               handshakeMs: ms,
-              provider: this.plugin.settings.provider,
-              model: this.plugin.settings.model,
+              provider: route.provider,
+              model: route.model,
+              routeSource: route.source,
               profile: this.plugin.settings.profile,
               cwd: this.plugin.getWorkspaceRoot(),
             })
@@ -2405,6 +2796,21 @@ class DshPlugin extends Plugin {
     return firstExisting(CLI_CANDIDATES, '')
   }
 
+  /** DSH 的配置目录（设置文档就在它下面）。 */
+  getDshHome() {
+    return this.settings.dshHome || path.join(os.homedir(), '.dsh')
+  }
+
+  /**
+   * 解析这次要用的模型路由。
+   *
+   * 每次调用都重新读一遍 DSH 的设置文档，因此 DSH 那边改了默认模型之后，
+   * 面板点「重启」就跟着换。
+   */
+  getRoute() {
+    return resolveRoute(this.settings, this.getDshHome())
+  }
+
   /** 记录一次握手结果（成功或失败），供诊断区展示。 */
   async recordHandshake(record) {
     this.settings.lastHandshake = record
@@ -2414,15 +2820,26 @@ class DshPlugin extends Plugin {
   /** 汇总诊断信息为 [标签, 值] 列表。 */
   getDiagnostics() {
     const settings = this.settings
+    const route = this.getRoute()
+    const freshness = checkBuildFreshness(this.getCliPath())
+    const dshInfo = settings.dshInfo
     const rows = [
       [t('diag.version'), this.manifest.version],
+      [t('diag.dshVersion'), dshInfo && dshInfo.version ? dshInfo.version : t('diag.dshNotProbed')],
       [t('diag.node'), this.getNodePath()],
       [t('diag.cli'), this.getCliPath() || t('diag.notFound')],
+      [
+        t('diag.cliFreshness'),
+        !freshness.applicable
+          ? t('diag.buildUnknown')
+          : (freshness.stale ? t('diag.buildStale') : t('diag.buildFresh')),
+      ],
       [t('diag.home'), settings.dshHome || path.join(os.homedir(), '.dsh')],
       [t('diag.profile'), settings.profile],
       [t('diag.cwd'), this.getWorkspaceRoot()],
-      [t('diag.route'), `${settings.provider} / ${settings.model}`],
-      [t('diag.effort'), settings.reasoningEffort || t('diag.modelDefault')],
+      [t('diag.route'), `${route.provider} / ${route.model}`],
+      [t('diag.routeSource'), routeSourceLabel(route.source)],
+      [t('diag.effort'), route.reasoningEffort || t('diag.modelDefault')],
       [t('diag.maxTokens'), String(settings.maxTokens || 0)],
     ]
     const last = settings.lastHandshake
@@ -2504,3 +2921,8 @@ module.exports.setLanguage = setLanguage
 module.exports.getLanguage = getLanguage
 module.exports.DICT = DICT
 module.exports.ERR = ERR
+module.exports.resolveRoute = resolveRoute
+module.exports.readDshDefaultModel = readDshDefaultModel
+module.exports.parseYamlSections = parseYamlSections
+module.exports.checkBuildFreshness = checkBuildFreshness
+module.exports.FALLBACK_ROUTE = FALLBACK_ROUTE

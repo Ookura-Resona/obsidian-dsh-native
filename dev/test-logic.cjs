@@ -14,6 +14,7 @@
 'use strict'
 
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const assert = require('assert')
 const Module = require('module')
@@ -50,6 +51,7 @@ console.log('加载 main.js…')
 const main = require(MAIN_PATH)
 const {
   DshView, explainError, buildSelectionPayload, buildSelectionReference, setLanguage, DICT, ERR,
+  resolveRoute, readDshDefaultModel, parseYamlSections, checkBuildFreshness, FALLBACK_ROUTE,
 } = main
 
 // 逻辑断言默认按中文，英文另有专门用例
@@ -338,6 +340,157 @@ test('工具行按 error 标记走不同样式类', () => {
   view.pushEntry({ role: 'tool', text: 'bad', error: true })
   assert.strictEqual(created[0].cls, 'dsh-tool')
   assert.strictEqual(created[1].cls, 'dsh-tool is-error')
+})
+
+console.log('')
+console.log('跟随 DSH 的模型设置')
+
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-native-test-'))
+
+/** 造一个 DSH 配置目录；content 以 { 开头就写成 settings.json。 */
+function makeHome(name, content) {
+  const dir = path.join(tmpRoot, name)
+  fs.mkdirSync(dir, { recursive: true })
+  if (content !== null) {
+    const file = content.trimStart().startsWith('{') ? 'settings.json' : 'settings.yaml'
+    fs.writeFileSync(path.join(dir, file), content, 'utf8')
+  }
+  return dir
+}
+
+const REAL_SETTINGS = [
+  'ui-onboarding:',
+  '  welcomeNoticeVersion: 2026-08-13.1',
+  'ui-theme:',
+  '  preference: system',
+  'agent-default-model:',
+  '  provider: deepseek-official',
+  '  model: deepseek-v4-flash-vision-exp',
+  '  reasoningEffort: high',
+  '',
+].join('\n')
+
+test('能解析真实形状的 settings.yaml', () => {
+  const sections = parseYamlSections(REAL_SETTINGS)
+  assert.deepStrictEqual(sections['agent-default-model'], {
+    provider: 'deepseek-official',
+    model: 'deepseek-v4-flash-vision-exp',
+    reasoningEffort: 'high',
+  })
+  assert.strictEqual(sections['ui-theme'].preference, 'system')
+})
+
+test('容忍引号、行尾注释与空行', () => {
+  const text = [
+    '# 顶层注释',
+    'agent-default-model:',
+    '  provider: "deepseek-official"   # 带注释',
+    "  model: 'deepseek-v4-flash'",
+    '',
+    'ui-theme:',
+    '  preference: system',
+  ].join('\n')
+  const sections = parseYamlSections(text)
+  assert.strictEqual(sections['agent-default-model'].provider, 'deepseek-official')
+  assert.strictEqual(sections['agent-default-model'].model, 'deepseek-v4-flash')
+  assert.strictEqual(sections['agent-default-model'].reasoningEffort, undefined)
+})
+
+test('支持流式写法 section: {a: 1, b: 2}', () => {
+  const sections = parseYamlSections('agent-default-model: {provider: p, model: m}\n')
+  assert.strictEqual(sections['agent-default-model'].provider, 'p')
+  assert.strictEqual(sections['agent-default-model'].model, 'm')
+})
+
+test('哈希值里的 # 不会被当成注释（值内含引号）', () => {
+  const sections = parseYamlSections('agent-default-model:\n  provider: "p#1"\n  model: m\n')
+  assert.strictEqual(sections['agent-default-model'].provider, 'p#1')
+})
+
+test('缺少分节 / 字段不全 / 目录不存在 -> 返回 null 交给调用方回退', () => {
+  assert.strictEqual(readDshDefaultModel(makeHome('no-section', 'ui-theme:\n  preference: system\n')), null)
+  assert.strictEqual(readDshDefaultModel(makeHome('half', 'agent-default-model:\n  provider: p\n')), null)
+  assert.strictEqual(readDshDefaultModel(path.join(tmpRoot, 'not-here')), null)
+})
+
+test('也能读 settings.json', () => {
+  const home = makeHome('json-home', JSON.stringify({ 'agent-default-model': { provider: 'p', model: 'm' } }))
+  assert.deepStrictEqual(readDshDefaultModel(home), { provider: 'p', model: 'm', reasoningEffort: '' })
+})
+
+const REAL_HOME = makeHome('real-home', REAL_SETTINGS)
+
+test('插件没填 -> 跟随 DSH 设置', () => {
+  const route = resolveRoute({ provider: '', model: '', reasoningEffort: '' }, REAL_HOME)
+  assert.strictEqual(route.provider, 'deepseek-official')
+  assert.strictEqual(route.model, 'deepseek-v4-flash-vision-exp')
+  assert.strictEqual(route.reasoningEffort, 'high')
+  assert.strictEqual(route.source, 'dsh')
+  assert.strictEqual(route.partialOverride, false)
+})
+
+test('插件填全了 -> 用插件的，未覆盖的 effort 仍跟随 DSH', () => {
+  const route = resolveRoute({ provider: 'acme', model: 'acme-large', reasoningEffort: '' }, REAL_HOME)
+  assert.strictEqual(route.provider, 'acme')
+  assert.strictEqual(route.model, 'acme-large')
+  assert.strictEqual(route.source, 'plugin')
+  assert.strictEqual(route.reasoningEffort, 'high', '未覆盖的 effort 应继续跟随 DSH')
+})
+
+test('只填一个 -> 不算覆盖，仍跟随 DSH 并标记出来', () => {
+  const route = resolveRoute({ provider: 'acme', model: '', reasoningEffort: '' }, REAL_HOME)
+  assert.strictEqual(route.provider, 'deepseek-official')
+  assert.strictEqual(route.source, 'dsh')
+  assert.strictEqual(route.partialOverride, true)
+})
+
+test('两边都没有 -> 用内置兜底并标记来源', () => {
+  const route = resolveRoute({ provider: '', model: '' }, path.join(tmpRoot, 'nothing-here'))
+  assert.strictEqual(route.source, 'fallback')
+  assert.strictEqual(route.provider, FALLBACK_ROUTE.provider)
+  assert.strictEqual(route.model, FALLBACK_ROUTE.model)
+})
+
+test('DSH 换了默认模型，解析结果跟着变（这就是「跟随」）', () => {
+  const home = makeHome('changed-home', 'agent-default-model:\n  provider: deepseek-official\n  model: deepseek-v5-whatever\n')
+  const route = resolveRoute({ provider: '', model: '' }, home)
+  assert.strictEqual(route.model, 'deepseek-v5-whatever')
+})
+
+console.log('')
+console.log('构建产物落后检测')
+
+test('产物比源码新 -> 不落后；源码更新后 -> 落后', () => {
+  const repo = path.join(tmpRoot, 'fake-repo')
+  const srcDir = path.join(repo, 'apps', 'cli', 'src')
+  const libDir = path.join(repo, 'apps', 'cli', 'lib')
+  fs.mkdirSync(srcDir, { recursive: true })
+  fs.mkdirSync(libDir, { recursive: true })
+  const binPath = path.join(libDir, 'bin.js')
+  fs.writeFileSync(binPath, '// built')
+  const sourceFile = path.join(srcDir, 'a.ts')
+  fs.writeFileSync(sourceFile, '// src')
+
+  const builtAt = new Date(Date.now() + 60000)
+  fs.utimesSync(binPath, builtAt, builtAt)
+  fs.utimesSync(sourceFile, new Date(), new Date())
+  assert.strictEqual(checkBuildFreshness(binPath).stale, false)
+
+  const later = new Date(Date.now() + 120000)
+  fs.utimesSync(sourceFile, later, later)
+  const result = checkBuildFreshness(binPath)
+  assert.strictEqual(result.applicable, true)
+  assert.strictEqual(result.stale, true)
+})
+
+test('不是检出布局 -> 判定为不适用', () => {
+  const lonely = path.join(tmpRoot, 'lonely')
+  fs.mkdirSync(lonely, { recursive: true })
+  const binPath = path.join(lonely, 'bin.js')
+  fs.writeFileSync(binPath, 'x')
+  const result = checkBuildFreshness(binPath)
+  assert.strictEqual(result.applicable, false)
+  assert.strictEqual(result.stale, false)
 })
 
 console.log('')

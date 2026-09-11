@@ -11,15 +11,19 @@
 
 | 脚本 | 作用 | 是否联网/调用模型 |
 |---|---|---|
-| `test-logic.cjs` | 纯逻辑回归测试：错误翻译、选区上下文构造、本轮结束判定、渲染/记录分工 | 否 |
-| `probe-session-resume.cjs` | 探针：实测 SDK 协议下 sessionId 的复用语义 | 是（三次极短对话） |
+| `test-logic.cjs` | 逻辑回归测试：i18n 完整性、错误翻译、选区上下文构造、本轮结束判定、渲染与记录分工、DSH 设置解析与模型路由、构建落后检测 | 否 |
+| `probe-route.cjs` | 打印插件这次会用的模型路由，以及它来自插件设置、DSH 设置还是内置兜底 | 否 |
+| `probe-session-resume.cjs` | 协议探针：实测 SDK 协议下 sessionId 的复用语义 | 是（三次极短对话） |
 | `obsidian-stub.js` | `obsidian` 模块测试替身，通过 `Module._resolveFilename` 钩子注入 | 否 |
 
 ## 运行
 
 ```sh
-# 纯逻辑测试，随时可跑
+# 逻辑测试，随时可跑
 node dev/test-logic.cjs
+
+# 看这次会用哪个模型（读 $DSH_HOME/settings.yaml）
+node dev/probe-route.cjs
 
 # 协议探针（会真实调用模型，需要可用的 DSH 凭据）
 node dev/probe-session-resume.cjs
@@ -32,6 +36,7 @@ node dev/probe-session-resume.cjs
 | `DSH_CLI` | `~/deepseek-harness/apps/cli/lib/bin.js` |
 | `DSH_NODE` | `node` |
 | `DSH_PROBE_CWD` | 当前工作目录 |
+| `DSH_HOME` | `~/.dsh`（`probe-route.cjs` 用它定位设置文档） |
 
 ## 探针测出的会话语义（重要）
 

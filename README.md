@@ -87,8 +87,8 @@ agent 的工作目录就是你的 vault，所以可以直接说「把 `灵茶山
 面板会显示一张错误卡片，写明是什么问题、怎么处理，并给出可以点的按钮。覆盖的情况包括：
 找不到 node、dsh 没有构建、provider 名写错、握手超时、运行时崩溃、凭据有问题、权限被拒、会话 id 冲突。
 
-设置页里还有两处可以自查：「开始检测」逐项检查环境，「诊断」区显示各项解析结果和最近一次握手记录，
-可以一键复制出来。
+设置页里还有两处可以自查：「开始检测」逐项检查环境，包括 dsh 版本和构建产物是否落后于源码；
+「诊断」区显示各项解析结果和最近一次握手记录，可以一键复制出来。
 
 ### 设置
 
@@ -101,15 +101,74 @@ agent 的工作目录就是你的 vault，所以可以直接说「把 `灵茶山
 | 环境 | 工作区目录（cwd） | vault 根目录 | 作为 `initialize` 的 cwd，沙箱把写入限制在这个目录内 |
 | 环境 | DSH_HOME | `~/.dsh` | 配置目录不在默认位置时才需要填 |
 | 环境 | profile | `sdk` | 一般不用改 |
-| 连接 | provider / model | `deepseek-official` / `deepseek-v4-flash-vision-exp` | 握手时会校验这个组合是否可用 |
-| 连接 | reasoning effort | `high` | 留空则用模型默认值 |
+| 连接 | provider / model | 留空（跟随 DSH） | 留空时用 DSH 自己设置的默认模型；两者需要成对填写 |
+| 连接 | reasoning effort | 留空（跟随 DSH） | 留空时用 DSH 设置里的值 |
 | 连接 | max tokens | `0` | 0 表示用模型默认值 |
+| 连接 | 重新读取 DSH 设置 | 按钮 | 在 DSH 界面改过默认模型后刷新上面的取值 |
 | 连接 | 测试连接 | 按钮 | 跑一次 `initialize` 握手 |
 | 交互 | 框选发送的内容 | 只发文件位置引用 | 另有「只发原文」「引用 + 原文」 |
 | 交互 | 框选后 | 插入输入框，等我编辑 | 或直接发送 |
 | 交互 | 显示工具调用 | 开 | 显示 🔧 工具名等活动行 |
 | 交互 | 笔记路径可点击 | 开 | 回复里的 vault 路径变成链接 |
 | 交互 | 崩溃后自动重连 | 开 | 最多重试 3 次，间隔 1s / 2s / 4s |
+
+## 模型从哪来
+
+插件不自己存一份模型设置。`provider` 和 `model` 默认留空，这时它会去读 DSH 的设置文档：
+
+```
+$DSH_HOME/settings.yaml
+  agent-default-model:
+    provider: ...
+    model: ...
+    reasoningEffort: ...
+```
+
+也就是说，**你在 DSH 的界面里改了默认模型，插件也会跟着改**。面板每次启动运行时都重新读一遍，
+所以在 DSH 里改完，回面板点「重启」就生效。
+
+优先级：
+
+1. 插件设置里 provider 与 model **都**填了 —— 用插件的
+2. 否则 DSH 设置文档里有 —— 用 DSH 的
+3. 都没有 —— 用插件内置的兜底值，DSH 更新后可能失效，设置页会标出来
+
+provider 与 model 必须成对，只填一个不算覆盖，设置页会给出提示。`reasoning effort` 可以单独覆盖。
+
+设置页「连接与模型路由」顶部会显示当前生效的组合和它的来源，命令行下可以用
+`node dev/probe-route.cjs` 查看。
+
+## 更新 DSH 之后
+
+插件只依赖 SDK 协议，所以 DSH 改前端、加界面功能都不会影响它。真正需要注意的是两件事。
+
+**1. 插件跑的是构建产物。**
+
+如果 dsh 是从 git 检出装的，插件启动的是 `apps/cli/lib/bin.js`，那是 `pnpm run build` 的产物。
+只 `git pull` 而不重新构建的话，插件会继续跑旧代码，而且不会报错。
+
+```sh
+cd <你的 dsh 仓库>
+git pull
+pnpm install
+pnpm run build      # 这一步不能省
+```
+
+设置页的环境检测里有一项专门查这个：比较 `apps/cli/src` 与 `lib/bin.js` 的修改时间，
+产物落后就会提示重新构建。
+
+**2. 模型设置会自动跟上。** 见上一节。DSH 那边改了默认模型，插件重启运行时就会读新的。
+
+如果 dsh 是用 npm 装的（`npm i -g @deepseek-ai/dsh`），更新就是一条命令，不需要构建：
+
+```sh
+npm i -g @deepseek-ai/dsh@latest
+```
+
+自动探测会去找 npm 全局目录下的 `@deepseek-ai/dsh/lib/bin.js`，所以不用手动填路径。
+
+**刷新时机**：插件不是常驻绑定 DSH 的，而是每次启动运行时新起一个进程。所以改完 dsh 之后回面板点「重启」即可，
+不需要重装插件，也不需要重启 Obsidian。诊断区会显示当前探测到的 dsh 版本，可以用来确认实际在跑哪一版。
 
 ## 会话与上下文
 
@@ -174,6 +233,7 @@ Obsidian 社区里已经有一些嵌入 DSH Web UI 的插件：它们用 iframe 
 | `DshRuntime` | JSON-RPC 客户端：启动子进程、分帧、请求与响应、通知分发、关闭流程 |
 | `DshView` | 对话面板：消息的渲染与记录、本轮结束判定、错误卡片、路径链接化、重连 |
 | `explainError` / `checkEnvironment` / `buildSelectionPayload` | 纯函数：错误翻译、环境检测、选区内容构造 |
+| `resolveRoute` / `readDshDefaultModel` | 模型路由解析：判断用插件设置、DSH 设置还是内置兜底 |
 | `DICT` / `t()` | 界面文案，中英各一套 |
 | `DshSettingTab` / `DshPlugin` | 设置页和插件入口 |
 
@@ -182,7 +242,8 @@ Obsidian 社区里已经有一些嵌入 DSH Web UI 的插件：它们用 iframe 
 测试脚本放在 [`dev/`](dev/)，用法见 [`dev/README.md`](dev/README.md)：
 
 ```sh
-node dev/test-logic.cjs           # 30 项逻辑测试，不联网
+node dev/test-logic.cjs           # 43 项逻辑测试，不联网
+node dev/probe-route.cjs          # 看这次会用哪个模型，不联网
 node dev/probe-session-resume.cjs # 协议探针，会真实调用模型
 ```
 
