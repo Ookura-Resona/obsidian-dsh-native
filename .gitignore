@@ -1,0 +1,13 @@
+# Obsidian 运行时数据（插件设置），不应提交
+data.json
+
+# 依赖与构建产物（本插件无构建步骤，保留以防将来引入）
+node_modules/
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

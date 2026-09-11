@@ -1,0 +1,10 @@
+{
+  "id": "dsh-harness",
+  "name": "DeepSeek Harness",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "把 DeepSeek Harness (dsh) 作为 AI 协作者嵌入 vault：以仓库为工作目录，可直接读写笔记、检索与执行多步任务。",
+  "author": "Ookura-Resona",
+  "authorUrl": "https://github.com/Ookura-Resona",
+  "isDesktopOnly": true
+}

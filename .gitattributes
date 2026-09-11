@@ -1,0 +1,7 @@
+# 统一换行：仓库内一律 LF，避免 Windows 协作者提交出 CRLF 差异
+* text=auto eol=lf
+
+# 二进制/产物保持原样
+*.png binary
+*.jpg binary
+*.zip binary
